@@ -7,6 +7,9 @@ from io import BytesIO
 import matplotlib.pyplot as plt
 from rasterio.mask import mask as rio_mask
 from rasterio import features
+from samgeo import SamGeo
+import os
+from segment_anything import sam_model_registry, SamPredictor
 
 class SolarEngine:
     def __init__(self):
@@ -90,12 +93,56 @@ class SolarEngine:
         
         return smooth_terrain
 
-    def segment_solar_facets(self, mns, mnt, lot_mask):
+    def generate_shadowless_texture(self, array):
         """
-        OBJECT-BASED SEGMENTATION (OBIA):
-        1. Capture ALL high objects (Hysteresis Thresholding).
-        2. Classify entire objects as 'Roof' or 'Tree' based on aggregate stats.
-        3. 'Shave' the walls at the very end.
+        Creates a 'Visual Texture' map for the AI that has NO SHADOWS.
+        Instead of simulating a Sun (which casts shadows), we visualize
+        Slope and Roughness directly.
+        """
+        # 1. Calculate Slope (The steepness)
+        x, y = np.gradient(array)
+        slope = np.sqrt(x*x + y*y)
+        
+        # 2. Normalize Slope for Visualization (0-255)
+        # Steep walls become bright, flat roofs become dark/gray.
+        # This creates distinct boundaries for the AI without casting shadows.
+        slope_norm = np.clip(slope, 0, 1.5) / 1.5 * 255
+        
+        # 3. Calculate Curvature/Roughness (The edges)
+        # This highlights the "outline" of the roof
+        curvature = scipy.ndimage.laplace(array)
+        curv_norm = np.clip(np.abs(curvature), 0, 1.0) * 255
+        
+        # 4. Combine into a "Texture Map"
+        # We blend them to give the AI a rich shape to look at.
+        texture = (0.7 * slope_norm + 0.3 * curv_norm).astype(np.uint8)
+        
+        return texture
+
+    def generate_hillshade(self, array, azimuth=315, angle_altitude=45):
+        """
+        Converts a DSM (Height Map) into a Visual Hillshade (Image).
+        This makes the 'Texture' of trees vs roofs visible to the AI.
+        """
+        x, y = np.gradient(array)
+        slope = np.pi/2. - np.arctan(np.sqrt(x*x + y*y))
+        aspect = np.arctan2(-x, y)
+        azimuthrad = azimuth * np.pi / 180.
+        altituderad = angle_altitude * np.pi / 180.
+         
+        shaded = np.sin(altituderad) * np.sin(slope) + \
+                 np.cos(altituderad) * np.cos(slope) * \
+                 np.cos(azimuthrad - aspect)
+        
+        # Normalize to 0-255 (Grayscale Image)
+        return (255 * (shaded + 1) / 2).astype(np.uint8)
+
+    def segment_solar_facets(self, mns, mnt, lot_mask, transform):
+        """
+        SHADOW-PROOF AI SEGMENTATION:
+        1. Input: 'Shadowless' Texture Map (Slope/Edge visualization).
+        2. Prompt: Peak of the roof.
+        3. Constraint: Result MUST be elevated (> 0.5m).
         """
         # --- 1. PRE-PROCESSING ---
         # Upsample 1m -> 0.5m for better resolution
@@ -124,78 +171,73 @@ class SolarEngine:
         
         nx, ny, nz, slope = self.calculate_derivatives(mns_high, cell_size)
         
-        # Calculate Roughness (Standard Deviation of Z-Normal)
-        # We will use this later to judge the whole blob
-        roughness_map = scipy.ndimage.generic_filter(nz, np.std, size=3)
-
-        # --- 3. HYSTERESIS THRESHOLDING (Capture the Shape) ---
-        # We use two height thresholds to be safe.
+        # --- 3. AI SEGMENTATION ---
         
-        # A. CORE (Strong): Definitely a structure (Height > 2.0m)
-        core_mask = (ndsm > 2.0) & lot_mask_high
+        # 1. Prepare the Visual Input (Shadowless)
+        # We stop using 'hillshade' which creates fake shadows.
+        # We use a Slope/Edge map which looks like a technical drawing.
+        texture_gray = self.generate_shadowless_texture(mns_high)
         
-        # B. BASIN (Weak): Could be a porch, garage, or edge (Height > 0.8m)
-        # We go very low (0.8m) because we will filter out noise later.
-        basin_mask = (ndsm > 0.8) & lot_mask_high
+        # 2. Find the "Prompt" (The Seed)
+        # We don't need a perfect segmentation, just ONE valid pixel.
+        # Find the highest point in the lot (most likely the roof peak)
+        valid_area = (ndsm > 2.0)
         
-        # C. RECONSTRUCTION: Grow the Core into the Basin
-        # This gives us the "Perfect DSM Shape" you saw, connected to at least one high point.
-        # It removes floating trash (bushes) that are only 1m high but have no 2m core.
-        structure = generate_binary_structure(2, 2)
-        object_mask = scipy.ndimage.binary_dilation(core_mask, mask=basin_mask, iterations=-1, structure=structure)
-
-        # --- 4. OBJECT CLASSIFICATION (The "Brain") ---
-        # Now we look at each blob and decide: House or Tree?
-        
-        labeled_blobs, num_blobs = label(object_mask, structure=structure)
-        
-        # We will build a new "Clean" mask
-        final_mask = np.zeros_like(object_mask)
-        
-        # Get indices of all pixels
-        # We loop through objects (1 to N). This is fast for < 100 objects.
-        for i in range(1, num_blobs + 1):
-            blob_indices = (labeled_blobs == i)
+        if np.sum(valid_area) == 0:
+            # Fallback: No house found
+            return np.zeros_like(mns_high, dtype=bool), nx, ny, nz, ndsm, texture_gray
             
-            # --- METRIC 1: Size ---
-            # Remove tiny noise (< 2m^2 -> 8 pixels)
-            if np.sum(blob_indices) < 8:
-                continue
-                
-            # --- METRIC 2: Roughness ---
-            # Calculate the AVERAGE roughness of this entire blob.
-            # Trees are chaotic everywhere. Roofs are smooth mostly.
-            avg_roughness = np.mean(roughness_map[blob_indices])
-            
-            # Threshold: 0.12 is a good cutoff. 
-            # Trees are usually > 0.20. Roofs are usually < 0.05.
-            if avg_roughness > 0.12:
-                continue # It's a Tree -> Delete it.
-                
-            # --- METRIC 3: Wall Artifacts ---
-            # If the blob is mostly vertical (Average slope > 1.0 rad), it's a wall/fence.
-            avg_slope = np.mean(slope[blob_indices])
-            if avg_slope > 1.2:
-                continue # It's a Wall -> Delete it.
+        # Get coordinates of the "Center of Mass" of the high area
+        y_indices, x_indices = np.where(valid_area)
+        center_y = int(np.mean(y_indices))
+        center_x = int(np.mean(x_indices))
+        
+        # 3. Run Segment Anything (SAM)
+        # Use direct SAM predictor to avoid wrapper issues
+        checkpoint_path = "/Users/felix/.cache/torch/hub/checkpoints/sam_vit_b_01ec64.pth"
+        if not os.path.exists(checkpoint_path):
+             # Fallback if not found (should be there from previous run)
+             raise FileNotFoundError(f"SAM checkpoint not found at {checkpoint_path}")
 
-            # If it passed all tests, it's a Roof. Keep it.
-            final_mask[blob_indices] = 1
+        sam = sam_model_registry["vit_b"](checkpoint=checkpoint_path)
+        predictor = SamPredictor(sam)
+        
+        # SAM expects RGB image (Duplicate channels)
+        texture_rgb = np.dstack((texture_gray, texture_gray, texture_gray))
+        predictor.set_image(texture_rgb)
+        
+        # Predicting with a Point Prompt:
+        # Note: point_coords expects [[x, y]] where x=col, y=row
+        masks, scores, logits = predictor.predict(
+            point_coords=np.array([[center_x, center_y]]), # The "Click" (Pixel Coords)
+            point_labels=np.array([1]), # 1 = Foreground
+            multimask_output=False # We want the best single mask
+        )
+        
+        # 4. Cleanup
+        # SAM returns masks of shape (1, H, W) if multimask_output=False
+        mask = masks[0]
             
+        # Constraint A: Must be inside the Lot
+        mask = mask & lot_mask_high
+        
+        # Constraint B: Must be ELEVATED.
+        # Shadows are 2D images projected on the ground (Height ~ 0).
+        # We set a low bar (0.5m) to keep porches, but kill ground shadows.
+        is_elevated = ndsm > 0.5
+        
+        final_mask = mask & is_elevated
+        
         # DEBUG: Store for visualization/stats
-        self.last_is_elevated = object_mask
-        self.last_is_roof_slope = (slope < 1.2) # Approximation for debug
-        self.last_is_smooth = (roughness_map < 0.12) # Approximation for debug
+        # We calculate these just for the debugger, even if AI doesn't use them directly
+        roughness = scipy.ndimage.generic_filter(nz, np.std, size=3)
+        
+        self.last_is_elevated = (ndsm > 2.0)
+        self.last_is_roof_slope = (slope < 1.0) # Standard roof slope
+        self.last_is_smooth = (roughness < 0.15) # Standard roof roughness
         self.last_viable_pixels = final_mask
 
-        # --- 5. EDGE POLISHING ---
-        # Since we used a low threshold (>0.8m), we captured the walls.
-        # We simply erode the mask by 1 pixel (0.5m) to "shave" the walls off.
-        final_mask = scipy.ndimage.binary_erosion(final_mask, structure=structure, iterations=1)
-        
-        # Fill internal holes (Skylights)
-        final_mask = scipy.ndimage.binary_fill_holes(final_mask)
-
-        return final_mask.astype(bool), nx, ny, nz, ndsm
+        return final_mask.astype(bool), nx, ny, nz, ndsm, texture_gray
 
     def calculate_irradiance(self, nx, ny, nz, mask):
         """
@@ -212,6 +254,10 @@ class SolarEngine:
         
         # Clip negative values (Self-shading / North Face)
         score = np.clip(score, 0, 1)
+        
+        # SMOOTHING: Apply Gaussian Filter to "iron out" the bumps
+        # sigma=1.0 is a gentle smooth (approx 3x3 pixel window)
+        score = gaussian_filter(score, sigma=1.0)
         
         # Apply mask
         score[~mask] = 0

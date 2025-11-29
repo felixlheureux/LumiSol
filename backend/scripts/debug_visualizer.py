@@ -136,76 +136,62 @@ def run_visual_test():
     lot_mask = engine.create_lot_mask(real_lot_polygon_geom, upscaled_shape, new_transform)
     
     # --- RUN SEGMENTATION ---
-    # segment_solar_facets handles upscaling internally for mns/mnt
-    structures_mask, nx, ny, nz, ndsm = engine.segment_solar_facets(mns_crop, mnt_crop, lot_mask)
+    # 4. Run Segmentation
+    print("   -> Running 'Scientific Facet Segmentation'...")
+    # Pass transform (even if dummy or real)
+    structures_mask, nx, ny, nz, ndsm, hillshade = engine.segment_solar_facets(mns_crop, mnt_crop, lot_mask, transform)
 
     if np.sum(structures_mask) == 0:
         print("❌ No structures found on lot.")
-        return
-
-    # --- SOLAR PHYSICS ---
-    print("   -> Calculating Solar Potential...")
+        # Continue to show what we have
     
-    # DEBUG STATS (MASKED BY LOT)
-    print(f"   [DEBUG] Lot Mask Pixels: {np.sum(lot_mask)}")
-    
-    # We use the stored masks from the engine instance
-    in_lot = lot_mask
-    
-    print(f"   [DEBUG] Elevated (>2m) in Lot: {np.sum(engine.last_is_elevated & in_lot)}")
-    print(f"   [DEBUG] Slope (<1.3rad) in Lot: {np.sum(engine.last_is_roof_slope & in_lot)}")
-    print(f"   [DEBUG] Smooth (<0.12) in Lot: {np.sum(engine.last_is_smooth & in_lot)}")
-    
-    # Intersections
-    print(f"   [DEBUG] Elevated + Slope in Lot: {np.sum(engine.last_is_elevated & engine.last_is_roof_slope & in_lot)}")
-    print(f"   [DEBUG] Elevated + Slope + Smooth in Lot: {np.sum(engine.last_viable_pixels)}") # viable includes lot_mask
-    
-    print(f"   [DEBUG] Final Structure Pixels: {np.sum(structures_mask)}")
-
-    solar_scores = engine.calculate_irradiance(nx, ny, nz, structures_mask)
-    
-    # --- PLOTTING ---
+    # --- 5. VISUALIZE ---
     print("   -> Rendering Plots...")
-    fig, axes = plt.subplots(1, 5, figsize=(30, 8))
     
-    # Zoom Window (Center 100m x 100m)
-    zoom_half = 100 # pixels (50m)
-    center_x = structures_mask.shape[1] // 2
-    center_y = structures_mask.shape[0] // 2
-    x_min, x_max = center_x - zoom_half, center_x + zoom_half
-    y_min, y_max = center_y - zoom_half, center_y + zoom_half
+    # Create a 2x3 grid (6 plots)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     
-    # 1. MNS (Surface) - Upscaled
-    # We need to upscale mns_crop manually for visualization to match mask
-    mns_high = zoom(mns_crop, SUPER_RES_FACTOR, order=1)
-    axes[0].imshow(mns_high, cmap='terrain')
-    axes[0].set_title("LiDAR Surface (MNS)")
-    axes[0].set_xlim(x_min, x_max)
-    axes[0].set_ylim(y_max, y_min) # Invert Y for image coords
+    # 1. MNS (Raw Surface)
+    ax = axes[0, 0]
+    im = ax.imshow(mns_crop, cmap='terrain')
+    ax.set_title("1. Raw LiDAR Surface (MNS)")
+    plt.colorbar(im, ax=ax)
     
-    # 2. nDSM (Height above Ground)
-    axes[1].imshow(ndsm, cmap='jet', vmin=0, vmax=10)
-    axes[1].set_title("nDSM (Height > Ground)")
-    axes[1].set_xlim(x_min, x_max)
-    axes[1].set_ylim(y_max, y_min)
-    
+    # 2. nDSM (Height Above Ground) - Masked to Lot
+    ax = axes[0, 1]
+    # Show nDSM but only inside the lot for clarity, or full?
+    # Let's show full nDSM but highlight lot
+    im = ax.imshow(ndsm, cmap='jet', vmin=0, vmax=10)
+    ax.set_title("2. Normalized Height (nDSM)")
+    plt.colorbar(im, ax=ax)
+
     # 3. Lot Mask
-    axes[2].imshow(lot_mask, cmap='gray')
-    axes[2].set_title("Legal Lot Mask")
-    axes[2].set_xlim(x_min, x_max)
-    axes[2].set_ylim(y_max, y_min)
+    ax = axes[0, 2]
+    ax.imshow(lot_mask, cmap='gray')
+    ax.set_title("3. Legal Lot Boundaries")
     
-    # 4. Solar Scores (Heatmap)
-    axes[3].imshow(solar_scores, cmap='inferno')
-    axes[3].set_title("Solar Irradiance (Heatmap)")
-    axes[3].set_xlim(x_min, x_max)
-    axes[3].set_ylim(y_max, y_min)
+    # 4. Hillshade (AI Vision)
+    ax = axes[1, 0]
+    ax.imshow(hillshade, cmap='gray')
+    ax.set_title("4. AI Vision (Hillshade)")
     
-    # 5. Final Structure Segmentation
-    axes[4].imshow(structures_mask, cmap='prism', interpolation='nearest')
-    axes[4].set_title("Detected Facets")
-    axes[4].set_xlim(x_min, x_max)
-    axes[4].set_ylim(y_max, y_min)
+    # 5. Solar Irradiance (Potential)
+    # We need to calculate it briefly for display
+    irradiance = engine.calculate_irradiance(nx, ny, nz, structures_mask)
+    ax = axes[1, 1]
+    im = ax.imshow(irradiance, cmap='hot')
+    ax.set_title("5. Solar Irradiance (kWh/m²)")
+    plt.colorbar(im, ax=ax)
+    
+    # 6. Final Segmentation
+    ax = axes[1, 2]
+    # Overlay mask on hillshade for context
+    ax.imshow(hillshade, cmap='gray')
+    # Create a red overlay for the mask
+    mask_overlay = np.zeros((*structures_mask.shape, 4))
+    mask_overlay[structures_mask] = [1, 0, 0, 0.5] # Red with 50% alpha
+    ax.imshow(mask_overlay)
+    ax.set_title(f"6. Final Roof Segments ({np.sum(structures_mask)} px)")
 
     plt.tight_layout()
     plt.savefig("debug_output.png")
