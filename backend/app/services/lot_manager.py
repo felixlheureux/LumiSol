@@ -119,9 +119,9 @@ class LotManager:
             if 'Point' in final_geom.geom_type:
                 print("⚠️ Warning: Found Point geometry in GPKG. Buffering...")
                 lot_poly = final_geom.buffer(30, cap_style=3)
-                return list(lot_poly.exterior.coords)
+                return lot_poly
             else:
-                return list(final_geom.exterior.coords)
+                return final_geom
             
         elif self.is_pmtiles:
             # PMTiles Strategy (Points -> Synthetic Polygon)
@@ -158,7 +158,7 @@ class LotManager:
             lot_series = gpd.GeoSeries([lot_geom_3857], crs="EPSG:3857")
             lot_projected = lot_series.to_crs(target_crs)
             
-            return list(lot_projected[0].exterior.coords)
+            return lot_projected[0]
         else:
             print(f"No strategy implemented for file type: {self.file_path}")
             return None

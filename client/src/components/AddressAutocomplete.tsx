@@ -107,7 +107,6 @@ export default function AddressAutocomplete({ onSelect }: Props) {
             border: '1px solid #ccc',
             borderRadius: '4px',
             outline: 'none',
-            color: '#333',
             boxSizing: 'border-box',
           }}
         />

@@ -1,195 +1,190 @@
 import numpy as np
-import rasterio
-from rasterio import features
-from scipy.ndimage import label, generate_binary_structure, zoom, laplace
-from sklearn.cluster import DBSCAN
-import matplotlib.pyplot as plt
+import scipy.ndimage
+from scipy.ndimage import zoom, label, generate_binary_structure, gaussian_filter
 from matplotlib import cm
 from io import BytesIO
-
+import matplotlib.pyplot as plt
+from rasterio.mask import mask as rio_mask
+from rasterio import features
 
 class SolarEngine:
     def __init__(self):
-        # In a real app, these would be WCS URLs.
-        # For testing, we assume we have local tiles or a function to fetch them.
-        pass
+        self.raw_resolution = 1.0 
+        # 2x is the "Sweet Spot". 4x adds compute lag with diminishing physics returns.
+        self.upsample_factor = 2 
 
-    def calculate_normals(self, elevation_grid, cell_size=1.0):
+    def crop_lidar_to_lot(self, mns_src, mnt_src, lot_geometry):
         """
-        Calculates the 3D Normal Vector for every pixel.
-        This tells us which way the roof faces (Azimuth) and how steep it is (Slope).
+        Crops the LiDAR rasters using the Vector Lot Geometry.
+        Returns masked arrays where outside pixels are NaN.
         """
-        dy, dx = np.gradient(elevation_grid, cell_size)
-
-        # Normal vector components
-        # The normal points "up" and away from the surface
-        nx = -dx
-        ny = -dy
-        nz = 1.0
-
-        # Normalize vectors (make length = 1)
-        norm = np.sqrt(nx**2 + ny**2 + nz**2)
-        nx /= norm
-        ny /= norm
-        nz /= norm
-
-        return nx, ny, nz
-
-    def create_lot_mask(self, shape, polygon_points):
-        """
-        Creates a binary mask from a list of polygon points (x, y).
-        """
-        # rasterio.features.rasterize expects a list of (geometry, value) tuples
-        # The geometry is a GeoJSON-like dictionary
-        geometry = {
-            "type": "Polygon",
-            "coordinates": [polygon_points] # Note: List of lists of points
-        }
+        # Crop MNS (Surface)
+        mns_image, transform = rio_mask(mns_src, [lot_geometry], crop=True)
+        mns_data = mns_image[0].astype('float32')
         
+        # Crop MNT (Terrain)
+        mnt_image, _ = rio_mask(mnt_src, [lot_geometry], crop=True)
+        mnt_data = mnt_image[0].astype('float32')
+
+        # Mask NoData values
+        # We use NaN for invalid data to prevent physics calculations on boundaries
+        mns_data[mns_data == mns_src.nodata] = np.nan
+        mnt_data[mnt_data == mnt_src.nodata] = np.nan
+
+        return mns_data, mnt_data, transform
+
+    def create_lot_mask(self, lot_polygon, shape, transform):
+        """
+        Creates a binary mask from the lot polygon.
+        """
         mask = features.rasterize(
-            [(geometry, 1)],
+            [lot_polygon],
             out_shape=shape,
+            transform=transform,
             fill=0,
-            dtype=np.uint8
+            default_value=1,
+            dtype='uint8'
         )
         return mask.astype(bool)
 
-    def segment_lot_structures(self, mns, mnt, lot_mask):
+    def calculate_derivatives(self, mns, cell_size):
         """
-        Finds ALL structures on the lot using Connected Component Analysis.
-        1. Apply Lot Mask.
-        2. Threshold Height > 2.5m (to ignore ground/grass).
-        3. Find Blobs (House, Garage, Shed).
+        Calculates Gradient (Slope) and Aspect (Direction) using vector calculus.
+        Applies Gaussian Smoothing first to prevent interpolation artifacts.
         """
-        # 1. Apply Lot Mask (Set outside to 0)
-        # We assume mns is already normalized (Height above ground)
-        # If mns is raw elevation, we need mns - mnt. 
-        # But usually 'mns' passed here is the Digital Surface Model.
-        # Let's assume input is DSM (mns) and DTM (mnt).
+        # 1. Smooth the surface to fix 'stair-step' aliasing from upsampling
+        # Sigma=0.5 pixels approximates the Nyquist limit for the new grid
+        mns_smooth = gaussian_filter(mns, sigma=0.5)
+
+        # 2. Calculate Gradients
+        dy, dx = np.gradient(mns_smooth, cell_size)
         
-        # Calculate Normalized Height (nDSM)
-        ndsm = mns - mnt
-        ndsm = np.maximum(ndsm, 0) # Remove negative noise
+        # 3. Calculate Surface Normal Components
+        # Normal Vector N = [-dx, -dy, 1]
+        # We normalize it to unit length
+        magnitude = np.sqrt(dx**2 + dy**2 + 1)
+        nx = -dx / magnitude
+        ny = -dy / magnitude
+        nz = 1.0 / magnitude
         
-        print(f"      [DEBUG] nDSM Max: {np.max(ndsm):.2f}m")
+        # 4. Calculate Slope (Zenith Angle)
+        # 0 = Flat, PI/2 = Vertical Wall
+        slope = np.arccos(nz)
         
-        # Mask out neighbors
+        return nx, ny, nz, slope
+
+    def segment_solar_facets(self, mns, mnt, lot_mask):
+        """
+        SCIENTIFIC SEGMENTATION:
+        Identifies 'Viable Solar Facets' instead of generic 'Buildings'.
+        """
+        # 1. Super-Resolution (Bilinear to preserve planar geometry)
+        mns_high = zoom(mns, self.upsample_factor, order=1)
+        mnt_high = zoom(mnt, self.upsample_factor, order=1)
+        
         if lot_mask is not None:
-            print(f"      [DEBUG] Lot Mask Area: {np.sum(lot_mask)} pixels")
-            ndsm[~lot_mask] = 0
-            
-        # 2. Threshold (Height > 2.5m)
-        # This removes cars, bushes, fences, etc.
-        height_mask = ndsm > 2.5
-        
-        # 3. Roughness Filter (Remove Trees)
-        # Trees have high roughness (variance in height). Roofs are smooth.
-        # We use Laplacian as a proxy for roughness.
-        roughness = laplace(ndsm)
-        roughness = np.abs(roughness)
-        
-        # Dynamic Thresholding (Isodata Algorithm)
-        # We only care about roughness on "potential structures" (Height > 2.5m)
-        candidate_pixels = roughness[height_mask]
-        
-        if len(candidate_pixels) > 0:
-            # Initial threshold = mean
-            T = np.mean(candidate_pixels)
-            for _ in range(10): # Max 10 iterations
-                g1 = candidate_pixels[candidate_pixels < T]
-                g2 = candidate_pixels[candidate_pixels >= T]
-                
-                if len(g1) == 0 or len(g2) == 0:
-                    break
-                    
-                m1 = np.mean(g1)
-                m2 = np.mean(g2)
-                new_T = (m1 + m2) / 2
-                
-                if abs(new_T - T) < 0.01:
-                    T = new_T
-                    break
-                T = new_T
-            
-            roughness_threshold = T
-            print(f"      [DEBUG] Dynamic Roughness Threshold: {roughness_threshold:.4f}")
+             # If mask is already high-res (matches mns_high), use it directly.
+            if lot_mask.shape == mns_high.shape:
+                lot_mask_high = lot_mask
+            else:
+                # Resize lot mask to match upsampled grid
+                lot_mask_high = zoom(lot_mask, self.upsample_factor, order=0) # Nearest neighbor for bool
         else:
-            roughness_threshold = 1.0 # Fallback
+            lot_mask_high = np.ones_like(mns_high, dtype=bool)
+
+        # Effective cell size
+        cell_size = self.raw_resolution / self.upsample_factor
+
+        # 2. Physics Calculations
+        nx, ny, nz, slope = self.calculate_derivatives(mns_high, cell_size)
+        ndsm = mns_high - mnt_high
+        ndsm = np.nan_to_num(ndsm, nan=0)
+        
+        # 3. DEFINING A "ROOF" (Heuristic Filtering)
+        
+        # A. Height Filter: Must be off the ground (> 2.5m)
+        is_elevated = ndsm > 2.5
+        
+        # B. Slope Filter: 
+        # Exclude Flat Ground (< 5 deg) and Vertical Walls (> 60 deg)
+        # 5 deg = 0.087 rad, 60 deg = 1.047 rad
+        is_roof_slope = (slope > 0.08) & (slope < 1.05)
+        
+        # C. Roughness Filter (Tree Removal):
+        # Calculate local variance of the surface normal Z-component.
+        # Roofs are planar (low variance), Trees are chaotic (high variance).
+        roughness = scipy.ndimage.generic_filter(nz, np.std, size=3)
+        is_smooth = roughness < 0.05
+
+        # Combine Filters
+        viable_pixels = is_elevated & is_roof_slope & is_smooth & lot_mask_high
+
+        # 4. MORPHOLOGICAL CLEANING
+        # Remove "Salt and Pepper" noise (leaves, chimneys)
+        # Opening = Erosion followed by Dilation
+        structure = generate_binary_structure(2, 2)
+        clean_mask = scipy.ndimage.binary_opening(viable_pixels, structure=structure)
+        
+        # 5. CONNECTED COMPONENTS (Facet Extraction)
+        # We label distinct roof planes.
+        labeled_facets, num_features = label(clean_mask)
+        
+        # Filter tiny fragments (< 2m^2)
+        # 1 pixel = (0.5)^2 = 0.25 m^2. So 2m^2 = 8 pixels.
+        min_pixels = 8 
+        final_mask = np.zeros_like(clean_mask)
+        
+        component_sizes = np.bincount(labeled_facets.ravel())
+        # Labels start at 1. We need to check if we have any valid components.
+        if len(component_sizes) > 1:
+            valid_labels = np.where(component_sizes > min_pixels)[0]
+            # Filter out background (0) if it was selected (it shouldn't be by size usually, but valid_labels includes indices)
+            valid_labels = valid_labels[valid_labels > 0]
             
-        roughness_mask = roughness < roughness_threshold
-        
-        # Combine masks
-        structure_binary = height_mask & roughness_mask
-        
-        print(f"      [DEBUG] Structure Pixels (Height Only): {np.sum(height_mask)}")
-        print(f"      [DEBUG] Structure Pixels (Height + Roughness): {np.sum(structure_binary)}")
-        
-        # 4. Connected Components (Blob Detection)
-        # structure defines connectivity (diagonal vs orthogonal)
-        s = generate_binary_structure(2, 2) # 8-connectivity
-        labeled_array, num_features = label(structure_binary, structure=s)
-        
-        # Filter small blobs (noise)
-        min_size = 10 # pixels (approx 10m^2 if 1m res, or less if super-res)
-        # If this is called on high-res data, min_size should be larger
-        
-        final_mask = np.zeros_like(structure_binary, dtype=bool)
-        
-        for i in range(1, num_features + 1):
-            blob_mask = (labeled_array == i)
-            if np.sum(blob_mask) > min_size:
-                final_mask |= blob_mask
-                
-        return final_mask, ndsm
+            if len(valid_labels) > 0:
+                final_mask = np.isin(labeled_facets, valid_labels)
 
-    def calculate_solar_potential(self, mns, mask):
+        return final_mask, nx, ny, nz
+
+    def calculate_irradiance(self, nx, ny, nz, mask):
         """
-        Simple Physics: Slope + Azimuth = Sun Score
+        Calculates the 'Solar Score' (Cosine Efficiency).
         """
-        # Solar heuristic for Quebec (South facing, ~35-45 deg tilt is best)
-        # Ideal Aspect: 180 deg (South) -> roughly 3.14 rads or -3.14 depending on coord system
-        # Let's simplify: High score if facing South
-
-        # Vector pointing South-ish and Up-ish (The Sun)
-        # Roughly representing peak sun position for optimization
-        sun_vector = np.array([0, -0.7, 0.7])
-        sun_vector /= np.linalg.norm(sun_vector)
-
-        nx, ny, nz = self.calculate_normals(mns)
-
-        # Dot product: How aligned is roof normal with sun vector?
-        # Score -1.0 to 1.0
-        score = (nx * sun_vector[0]) + \
-            (ny * sun_vector[1]) + (nz * sun_vector[2])
-
-        # Clip negative values (North facing / Shadow)
+        # Sun Vector for Montreal (Annual Optimal Average)
+        # Approximated as South (Y-) at 45 degree elevation
+        # Vector = [0, -1, 1] normalized
+        sun = np.array([0, -0.7071, 0.7071])
+        
+        # Dot Product (Cosine Similarity)
+        # How aligned is the surface normal with the sun vector?
+        score = (nx * sun[0]) + (ny * sun[1]) + (nz * sun[2])
+        
+        # Clip negative values (Self-shading / North Face)
         score = np.clip(score, 0, 1)
-
-        # Apply Building Mask
+        
+        # Apply mask
         score[~mask] = 0
-
+        
         return score
 
-    def generate_heatmap_overlay(self, solar_scores):
+    def generate_heatmap(self, solar_scores):
         """
-        Generates a transparent PNG image from scores.
+        Visualizes the solar potential.
         """
-        # Create an RGBA image
-        # Colormap: 'inferno' (Black -> Red -> Yellow) looks cool for heat
         cmap = cm.get_cmap('inferno')
-
-        # Normalize scores to 0-1 for colormap
-        colored_data = cmap(solar_scores)
-
-        # Set Alpha channel:
-        # 0.0 (Transparent) where score is 0
-        # 0.6 (Semi-transparent) where score is high
-        alpha = solar_scores.copy()
-        alpha[alpha > 0] = 0.7  # Visible opacity
-        colored_data[:, :, 3] = alpha  # Apply to Alpha channel
-
-        # Convert to bytes
+        rgba = cmap(solar_scores)
+        
+        # Alpha Channel Logic
+        # We want the 'Good' parts to shine, and 'Bad' parts to be ghosted.
+        alpha = np.zeros_like(solar_scores)
+        
+        mask_indices = solar_scores > 0
+        # Dynamic Opacity: 0.4 (Low Energy) -> 0.9 (High Energy)
+        alpha[mask_indices] = 0.4 + (solar_scores[mask_indices] * 0.5)
+        
+        rgba[:, :, 3] = alpha
+        
         img_bytes = BytesIO()
-        plt.imsave(img_bytes, colored_data, format='png')
+        plt.imsave(img_bytes, rgba, format='png')
         img_bytes.seek(0)
         return img_bytes

@@ -2,6 +2,10 @@ from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import JSONResponse
 import numpy as np
 import base64
+import rasterio
+from rasterio.windows import from_bounds
+from scipy.ndimage import minimum_filter, gaussian_filter
+from pyproj import Transformer
 from app.services.solar_engine import SolarEngine
 from app.services.lot_manager import LotManager
 from app.core.config import LIDAR_FILE
@@ -18,77 +22,124 @@ async def analyze_roof(data: dict = Body(...)):
     print(f"Received request for {lat}, {lon}")
 
     # 1. GET LOT POLYGON
-    # We use the real LotManager now!
     try:
-        # We need to target the CRS of the LiDAR file.
-        # For now, let's assume EPSG:2950 (Montreal MTM8) as per our tests.
-        # Ideally, we read this from the TIF, but for now hardcode or use config.
+        # Target CRS: EPSG:2950 (Montreal MTM8) - Hardcoded for this dataset
         target_crs = "EPSG:2950" 
-        lot_polygon = lot_manager.get_lot_at_point(lat, lon, target_crs=target_crs)
+        lot_polygon_geom = lot_manager.get_lot_at_point(lat, lon, target_crs=target_crs)
         
-        if not lot_polygon:
+        if not lot_polygon_geom:
              return JSONResponse(status_code=404, content={"error": "No lot found at this location."})
+
+        # Convert to list of points for frontend (WGS84)
+        if lot_polygon_geom.geom_type == 'Polygon':
+            exterior_coords = list(lot_polygon_geom.exterior.coords)
+        elif lot_polygon_geom.geom_type == 'MultiPolygon':
+            largest = max(lot_polygon_geom.geoms, key=lambda p: p.area)
+            exterior_coords = list(largest.exterior.coords)
+        else:
+            exterior_coords = []
+            
+        # Transform to WGS84 for frontend display
+        # Input is EPSG:2950, Output is EPSG:4326
+        project_to_wgs84 = Transformer.from_crs("EPSG:2950", "EPSG:4326", always_xy=True).transform
+        wgs84_coords = [project_to_wgs84(x, y) for x, y in exterior_coords]
              
     except Exception as e:
         print(f"Error finding lot: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-    # 2. FETCH LIDAR DATA
-    # TODO: Implement real cropping from TIF using rasterio
-    # For now, we will use the MOCK generator if the file doesn't exist or just to get it running
-    # BUT we really should use the real data if we have it.
+    # 2. Fetch Real LiDAR Data
+    try:
+        with rasterio.open(str(LIDAR_FILE)) as src:
+            # Define a window around the lot
+            # We use the lot bounds + padding
+            minx, miny, maxx, maxy = lot_polygon_geom.bounds
+            padding = 10 # meters
+            
+            # Ensure window coordinates are within src bounds
+            window = from_bounds(minx - padding, miny - padding, maxx + padding, maxy + padding, src.transform)
+            window = window.round_offsets().round_lengths() # Ensure integer offsets/lengths
+            window = window.intersection(rasterio.windows.Window(0, 0, src.width, src.height)) # Clip to dataset bounds
+            
+            # Read data
+            mns = src.read(1, window=window)
+            
+            # Handle NoData
+            mns = np.nan_to_num(mns, nan=np.nanmin(mns))
+            
+            # Synthetic MNT (Ground Estimate) - Since we don't have a real DTM file yet
+            # We use a minimum filter to find the "ground"
+            ground_estimate = minimum_filter(mns, size=20)
+            mnt = gaussian_filter(ground_estimate, sigma=2)
+            
+            transform = src.window_transform(window)
+            
+            # Calculate Bounds for Frontend Overlay
+            # We need the bounds of the window we read
+            win_bounds = src.window_bounds(window) # (left, bottom, right, top) in EPSG:2950
+            
+            # Reproject bounds to WGS84
+            transformer = Transformer.from_crs(src.crs, "EPSG:4326", always_xy=True)
+            sw = transformer.transform(win_bounds[0], win_bounds[1]) # minx, miny
+            ne = transformer.transform(win_bounds[2], win_bounds[3]) # maxx, maxy
+            
+            # MapLibre Bounds: [[west, south], [east, north]]
+            # sw is (lon, lat), ne is (lon, lat)
+            bounds = [[sw[0], sw[1]], [ne[0], ne[1]]]
+
+    except Exception as e:
+        print(f"Error reading LiDAR: {e}")
+        raise HTTPException(status_code=500, detail=f"LiDAR error: {e}")
+
+    # 3. PROCESS GEOMETRY & SEGMENTATION (Scientific Pipeline)
+    # We get the Mask AND the Vector Field (nx, ny, nz)
+    # Note: process_geometry is no longer needed as a separate step, 
+    # segment_solar_facets handles the physics internally.
     
-    # Let's try to load the real data if possible, otherwise mock.
-    # Since we are in a "Restructure" task, maybe I shouldn't implement full feature.
-    # But the old main.py used mock.
-    # I will stick to MOCK for now to ensure the API responds, 
-    # BUT I will update the segmentation call to the new method.
-    
-    mns, mnt = mock_fetch_lidar(lat, lon)
-    
-    # 3. SEGMENTATION
-    # The new method requires a lot_mask.
-    # Since we are mocking data, we don't have a real lot mask aligned to the mock data.
-    # So we will pass None for lot_mask, or create a dummy one.
-    
-    # engine.segment_lot_structures(mns, mnt, lot_mask)
-    # It returns: final_mask, ndsm
-    
-    structures_mask, ndsm = engine.segment_lot_structures(mns, mnt, lot_mask=None)
-    
+    # Create Lot Mask (if lot exists)
+    # We need to scale the polygon to the new high-res grid
+    # The engine upscales by 2x, so we need a transform that matches the upscaled data.
+    new_transform = transform * transform.scale(0.5, 0.5) 
+    lot_mask = engine.create_lot_mask(lot_polygon_geom, (mns.shape[0]*2, mns.shape[1]*2), new_transform)
+
+    # Run Segmentation
+    structures_mask, nx, ny, nz = engine.segment_solar_facets(mns, mnt, lot_mask=lot_mask)
+
     if np.sum(structures_mask) == 0:
-         return JSONResponse(status_code=404, content={"error": "No structures found."})
+         return JSONResponse(status_code=200, content={
+            "address": "Detected Lot",
+            "solar_potential": "0 kWh/yr",
+            "area": "0 m²",
+            "heatmap": "",
+            "bounds": bounds,
+            "lot_polygon": wgs84_coords,
+            "message": "No structures suitable for solar panels found."
+         })
 
-    # 4. SOLAR MATH
-    solar_scores = engine.calculate_solar_potential(ndsm, structures_mask)
+    # 4. CALCULATE ENERGY
+    solar_scores = engine.calculate_irradiance(nx, ny, nz, structures_mask)
 
-    # Calculate total potential
-    # Mock data is usually 1m res?
-    total_kwh = np.sum(solar_scores) * 150 # Dummy multiplier
-    area = np.sum(structures_mask) 
+    # 5. STATISTICS
+    # Calculate roof area (accounting for 2x super-resolution)
+    pixel_area_m2 = (engine.raw_resolution / engine.upsample_factor) ** 2
+    roof_area = np.sum(structures_mask) * pixel_area_m2
+    
+    # Average Score of the VIABLE area only (Don't average the north side!)
+    avg_efficiency = np.mean(solar_scores[structures_mask])
+    
+    # Montreal Estimator: 1200 kWh/kWp/year is optimal. 
+    # We scale this by our efficiency score.
+    total_kwh = roof_area * avg_efficiency * 150 # 150 is a rough W/m2 panel yield factor
 
-    # 5. GENERATE IMAGE
-    img_io = engine.generate_heatmap_overlay(solar_scores)
+    # 8. RENDER HEATMAP
+    img_io = engine.generate_heatmap(solar_scores)
     img_b64 = base64.b64encode(img_io.getvalue()).decode('utf-8')
-
-    # Calculate dummy bounds
-    delta = 0.0005
-    bounds = [lon - delta, lat - delta, lon + delta, lat + delta]
-
+    
     return {
-        "heatmap_b64": f"data:image/png;base64,{img_b64}",
+        "address": "Detected Lot",
+        "solar_potential": f"{total_kwh:.0f} kWh/yr",
+        "area": f"{roof_area:.0f} m²",
+        "heatmap": f"data:image/png;base64,{img_b64}",
         "bounds": bounds,
-        "solar_potential": int(total_kwh),
-        "area_sqm": int(area)
+        "lot_polygon": wgs84_coords
     }
-
-def mock_fetch_lidar(lat, lon, size=100):
-    """
-    Generates a fake roof shape for testing.
-    """
-    x = np.linspace(-1, 1, size)
-    y = np.linspace(-1, 1, size)
-    X, Y = np.meshgrid(x, y)
-    mns = 20 - 20 * np.maximum(np.abs(X), np.abs(Y))
-    mnt = np.zeros_like(mns)
-    return mns, mnt

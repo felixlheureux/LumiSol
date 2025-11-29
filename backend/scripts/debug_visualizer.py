@@ -171,9 +171,8 @@ def run_visual_test():
     SUPER_RES_FACTOR = 2 # 2x upscaling (1m -> 0.5m)
     print(f"   -> Upscaling Data (Factor: {SUPER_RES_FACTOR}x)...")
     
-    # Order=1 (Bilinear) or 3 (Cubic). Cubic is better for smooth surfaces.
-    mns_crop = zoom(mns_crop, SUPER_RES_FACTOR, order=3)
-    mnt_crop = zoom(mnt_crop, SUPER_RES_FACTOR, order=3)
+    # Use engine's upscaling (Lanczos)
+    mns_crop, mnt_crop = engine.upscale_data(mns_crop, mnt_crop, scale_factor=SUPER_RES_FACTOR)
     
     print(f"      New Shape: {mns_crop.shape}")
 

@@ -26,61 +26,72 @@ LumiSol takes a "Legal-Physics Hybrid" approach. Instead of guessing where a bui
 *   **Mapping**: MapLibre GL JS
 *   **Imagery**: Google Satellite / Azure Maps (Bing)
 *   **Search**: Address Autocomplete via Photon
+*   **Package Manager**: `pnpm`
 
 ### Backend (The Brain)
 *   **API**: Python (FastAPI)
-*   **Spatial Database**: PMTiles / GeoPackage queried via GeoPandas / Shapely
-*   **Physics Engine**: Rasterio, NumPy, SciPy
+*   **Manager**: `uv` (Modern Python Package Manager)
+*   **Spatial Database**: GeoPackage (`.gpkg`) queried via GeoPandas / Shapely
+*   **Physics Engine**: Rasterio, NumPy, SciPy (ndimage)
 
 ### Algorithms
-*   **Super-Resolution**: Bicubic upsampling of 1m LiDAR grids to sub-meter resolution.
-*   **Curvature Detection**: Using Laplacian filters to detect "invisible" seams (parapets) between connected buildings.
-*   **Vector Math**: Calculating Surface Normals and Solar Incidence angles for every pixel.
+*   **Super-Resolution**: Lanczos upsampling (2x) of 1m LiDAR grids to 0.5m resolution. This preserves sharp roof edges better than standard cubic interpolation.
+*   **Strict Legal Alignment**: Uses official Cadastral Polygons to mask LiDAR data, ensuring zero leakage into neighboring properties.
+*   **Dynamic Roughness Filtering**: Uses Laplacian filters and Isodata thresholding to distinguish smooth roofs from rough trees.
+*   **Morphological Cleanup**: Applies Opening and Closing operations to remove noise (salt-and-pepper) and fill small holes in detected structures.
 
-## 📐 Key Algorithms
+## 📂 Project Structure
 
-### 1. Lot-Based Isolation (The "Neighbor Firewall")
-Solving the segmentation problem by using legal data instead of computer vision.
-
-*   **Input**: User Coordinate (lat, lon).
-*   **Process**: Spatial query against the `quebec_lots.pmtiles` database (indexed).
-*   **CRS Standardization**: Government LiDAR often uses projected metric coordinates (e.g., MTM Zone 8), while web maps use Lat/Lon (WGS84). The backend automatically reprojects the cadastral polygon (`.to_crs()`) to match the LiDAR's native projection before cropping, ensuring sub-centimeter alignment.
-*   **Action**: The LiDAR Digital Surface Model (MNS) is masked. Pixels outside the property line are set to 0.
-*   **Benefit**: It is mathematically impossible for the algorithm to "leak" onto a neighbor's roof, even if the roofs are physically connected.
-
-### 2. Super-Resolution & Curvature Barriers
-Raw government data is "blocky" (1m/pixel). We treat it as a signal processing problem.
-
-*   **Super-Res**: We upsample the grid by 2x-4x using interpolation to turn "stair-step" roofs into smooth slopes.
-*   **Curvature Barrier**: To separate a house from its own extension (or a row-house wall), we calculate the Laplacian Curvature. High curvature indicates a "seam" or wall, which acts as a hard barrier for our segmentation logic.
-
-### 3. Automatic Structure Detection
-Instead of a neural network, we use physics-based heuristics:
-
-`Is Structure = (Height > 2.5m) AND (Roughness < Threshold)`
-
-This effectively filters out trees (high roughness) and cars (low height), leaving only viable solar surfaces.
+```
+LumiSol/
+├── backend/                 # FastAPI Application
+│   ├── app/
+│   │   ├── main.py          # Entry Point
+│   │   ├── api/             # API Routes
+│   │   ├── services/        # Core Logic (SolarEngine, LotManager)
+│   │   └── core/            # Config
+│   ├── data/                # Data Files (Ignored by Git)
+│   │   ├── quebec_lots.gpkg
+│   │   └── *.tif
+│   ├── scripts/             # Standalone Tools (Debug Visualizer)
+│   ├── pyproject.toml       # UV Dependencies
+│   └── uv.lock
+├── client/                  # React Application
+│   ├── src/
+│   └── package.json
+```
 
 ## 🚀 Getting Started
 
 ### Prerequisites
-*   Node.js (v18+)
-*   Python 3.9+
-*   Data Requirement: You need the `quebec_lots.pmtiles` file in the `backend/` folder.
+*   **Node.js** (v18+) & **pnpm**
+*   **Python** (3.13+) & **uv**
+*   **Data**: Place `quebec_lots.gpkg` and your LiDAR `.tif` files in `backend/data/`.
 
 ### 1. Start the Backend
 ```bash
 cd backend
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+# Install dependencies and sync environment
+uv sync
+
+# Run the API
+uv run uvicorn app.main:app --reload --port 8000
 ```
 
 ### 2. Start the Frontend
 ```bash
-cd frontend
-npm install
-npm run dev
+cd client
+pnpm install
+pnpm dev
 ```
+
+### 3. Run Visual Debugger
+To test the segmentation logic without the frontend:
+```bash
+cd backend
+uv run python scripts/debug_visualizer.py
+```
+This will generate `debug_output.png` showing the segmentation results for a sample lot.
 
 ## 🔮 Roadmap
 
