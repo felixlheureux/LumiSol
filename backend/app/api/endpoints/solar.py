@@ -102,8 +102,9 @@ async def analyze_roof(data: dict = Body(...)):
     new_transform = transform * transform.scale(0.5, 0.5) 
     lot_mask = engine.create_lot_mask(lot_polygon_geom, (mns.shape[0]*2, mns.shape[1]*2), new_transform)
 
-    # Run Segmentation
-    structures_mask, nx, ny, nz = engine.segment_solar_facets(mns, mnt, lot_mask=lot_mask)
+    # 3. Segment Roofs
+    # Now returns 5 values: mask, nx, ny, nz, ndsm
+    structures_mask, nx, ny, nz, _ = engine.segment_solar_facets(mns, mnt, lot_mask=lot_mask)
 
     if np.sum(structures_mask) == 0:
          return JSONResponse(status_code=200, content={
