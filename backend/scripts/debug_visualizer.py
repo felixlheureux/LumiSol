@@ -137,7 +137,7 @@ def run_visual_test():
     
     # --- RUN SEGMENTATION ---
     # segment_solar_facets handles upscaling internally for mns/mnt
-    structures_mask, nx, ny, nz = engine.segment_solar_facets(mns_crop, mnt_crop, lot_mask)
+    structures_mask, nx, ny, nz, ndsm = engine.segment_solar_facets(mns_crop, mnt_crop, lot_mask)
 
     if np.sum(structures_mask) == 0:
         print("❌ No structures found on lot.")
@@ -166,7 +166,7 @@ def run_visual_test():
     
     # --- PLOTTING ---
     print("   -> Rendering Plots...")
-    fig, axes = plt.subplots(1, 4, figsize=(24, 8))
+    fig, axes = plt.subplots(1, 5, figsize=(30, 8))
     
     # Zoom Window (Center 100m x 100m)
     zoom_half = 100 # pixels (50m)
@@ -183,23 +183,29 @@ def run_visual_test():
     axes[0].set_xlim(x_min, x_max)
     axes[0].set_ylim(y_max, y_min) # Invert Y for image coords
     
-    # 2. Lot Mask
-    axes[1].imshow(lot_mask, cmap='gray')
-    axes[1].set_title("Legal Lot Mask")
+    # 2. nDSM (Height above Ground)
+    axes[1].imshow(ndsm, cmap='jet', vmin=0, vmax=10)
+    axes[1].set_title("nDSM (Height > Ground)")
     axes[1].set_xlim(x_min, x_max)
     axes[1].set_ylim(y_max, y_min)
     
-    # 3. Solar Scores (Heatmap)
-    axes[2].imshow(solar_scores, cmap='inferno')
-    axes[2].set_title("Solar Irradiance (Heatmap)")
+    # 3. Lot Mask
+    axes[2].imshow(lot_mask, cmap='gray')
+    axes[2].set_title("Legal Lot Mask")
     axes[2].set_xlim(x_min, x_max)
     axes[2].set_ylim(y_max, y_min)
     
-    # 4. Final Structure Segmentation
-    axes[3].imshow(structures_mask, cmap='prism', interpolation='nearest')
-    axes[3].set_title("Detected Facets")
+    # 4. Solar Scores (Heatmap)
+    axes[3].imshow(solar_scores, cmap='inferno')
+    axes[3].set_title("Solar Irradiance (Heatmap)")
     axes[3].set_xlim(x_min, x_max)
     axes[3].set_ylim(y_max, y_min)
+    
+    # 5. Final Structure Segmentation
+    axes[4].imshow(structures_mask, cmap='prism', interpolation='nearest')
+    axes[4].set_title("Detected Facets")
+    axes[4].set_xlim(x_min, x_max)
+    axes[4].set_ylim(y_max, y_min)
 
     plt.tight_layout()
     plt.savefig("debug_output.png")

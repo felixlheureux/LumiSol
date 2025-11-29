@@ -73,84 +73,105 @@ class SolarEngine:
         
         return nx, ny, nz, slope
 
+    def _estimate_terrain(self, mns_grid, window_size_meters=30):
+        """
+        Creates a 'Rolling Ball' Digital Terrain Model (DTM).
+        This ignores houses and finds the underlying ground, even on slopes.
+        """
+        # Convert meters to pixels (e.g. 30m / 0.5m = 60 pixels)
+        pixels = int(window_size_meters / (self.raw_resolution / self.upsample_factor))
+        
+        # 1. Minimum Filter (Erosion): Finds the lowest pixel in the neighborhood
+        rough_terrain = scipy.ndimage.minimum_filter(mns_grid, size=pixels)
+        
+        # 2. Gaussian Filter: Smooths the blocky erosion artifacts
+        smooth_terrain = gaussian_filter(rough_terrain, sigma=pixels/4)
+        
+        return smooth_terrain
+
     def segment_solar_facets(self, mns, mnt, lot_mask):
         """
-        SCIENTIFIC SEGMENTATION (IMPROVED):
-        Optimized for coverage on both Flat (Montreal) and Pitched roofs.
+        FINAL STRATEGY: 'Seed & Grow' with Lot Constraints.
+        1. SEED: Find the safe, smooth center of the roof.
+        2. CONSTRAINT: Use Lot Mask + nDSM Height as strict walls.
+        3. GROW: Flood-fill the Seed until it hits the Constraint.
         """
-        # 1. Super-Resolution (Bilinear to preserve planar geometry)
+        # --- 1. UPSAMPLING & TERRAIN ---
+        # Upsample 1m -> 0.5m for better edge resolution
         mns_high = zoom(mns, self.upsample_factor, order=1)
-        mnt_high = zoom(mnt, self.upsample_factor, order=1)
         
-        # Resize lot mask (Nearest Neighbor to keep it sharp boolean)
-        if lot_mask is not None and lot_mask.shape != mns_high.shape:
-            lot_mask_high = zoom(lot_mask, self.upsample_factor, order=0)
+        # Dynamic Terrain (Fixes the "2.5m" hill issue)
+        mnt_high = self._estimate_terrain(mns_high, window_size_meters=30)
+        
+        # Upsample the Lot Mask (Nearest Neighbor to keep it sharp)
+        if lot_mask is not None:
+            if lot_mask.shape == mns_high.shape:
+                lot_mask_high = lot_mask
+            else:
+                lot_mask_high = zoom(lot_mask, self.upsample_factor, order=0)
         else:
-            lot_mask_high = lot_mask if lot_mask is not None else np.ones_like(mns_high, dtype=bool)
+            lot_mask_high = np.ones_like(mns_high, dtype=bool)
 
         cell_size = self.raw_resolution / self.upsample_factor
 
-        # 2. Physics Calculations
-        nx, ny, nz, slope = self.calculate_derivatives(mns_high, cell_size)
+        # --- 2. PHYSICS CALCS ---
+        # True Height above ground
         ndsm = mns_high - mnt_high
         ndsm = np.nan_to_num(ndsm, nan=0)
         
-        # 3. DEFINING A "ROOF" (Heuristic Filtering)
+        # STRICT MASKING: We only care about the lot's nDSM
+        # This zeros out neighbors so they don't appear in debug or logic
+        ndsm = ndsm * lot_mask_high
         
-        # A. Height Filter: Lowered slightly to catch garages/sheds
-        is_elevated = ndsm > 2.0 
-        
-        # B. Slope Filter (CRITICAL FIX): 
-        # Allow Flat Roofs (0 deg) up to steep roofs (75 deg = 1.3 rad)
-        # We REMOVED the lower bound (> 0.08) because Montreal has flat roofs!
-        is_roof_slope = slope < 1.3 
-        
-        # C. Roughness Filter (Relaxed):
-        # We relax the threshold from 0.05 to 0.12 to allow for shingles/chimneys
+        # Geometry
+        nx, ny, nz, slope = self.calculate_derivatives(mns_high, cell_size)
+
+        # --- 3. THE "SEED" (High Confidence) ---
+        # Find the "Soft Center" of the roof. We can be very strict here.
+        # It must be Flat-ish and Smooth to avoid trees.
         roughness = scipy.ndimage.generic_filter(nz, np.std, size=3)
-        is_smooth = roughness < 0.12
+        
+        is_high_enough = ndsm > 1.5  # 1.5m allows for sheds/decks
+        is_smooth_core = roughness < 0.12
+        is_flat_core = slope < 1.3
+        
+        seeds = is_high_enough & is_smooth_core & is_flat_core & lot_mask_high
+        
+        # DEBUG: Store for visualization/stats
+        self.last_is_elevated = is_high_enough
+        self.last_is_roof_slope = is_flat_core
+        self.last_is_smooth = is_smooth_core
+        self.last_viable_pixels = seeds
 
-        # Combine Filters
-        viable_pixels = is_elevated & is_roof_slope & is_smooth & lot_mask_high
+        # --- 4. THE "POTENTIAL" (The Container) ---
+        # This defines the maximum possible extent of the roof.
+        # It MUST be high, and it MUST be inside the lot.
+        # We don't care about roughness here (edges are rough).
+        potential_mask = (ndsm > 1.5) & lot_mask_high
 
-        # 4. MORPHOLOGICAL CLEANUP (The "Fill" Strategy)
-        # You need to import these at the top of your file:
-        # from scipy.ndimage import binary_closing, binary_fill_holes, binary_opening
+        # --- 5. GROWTH LOOP (Geodesic Reconstruction) ---
+        # Grow the Seeds until they hit the walls of 'potential_mask'
+        structure = generate_binary_structure(2, 2)
+        grown_mask = seeds.copy()
         
-        # Step A: CLOSING (Connect gaps)
-        # This joins pixels that are close together, fixing the "swiss cheese" effect
-        structure = generate_binary_structure(2, 2) # 8-connectivity
-        closed_mask = scipy.ndimage.binary_closing(viable_pixels, structure=structure, iterations=2)
-        
-        # Step B: FILL HOLES (Solidify)
-        # If we have a ring of valid pixels (e.g., roof edges), fill the inside
-        filled_mask = scipy.ndimage.binary_fill_holes(closed_mask)
-        
-        # Step C: OPENING (Only NOW do we remove noise)
-        # Remove tiny specks that are definitely not roofs
-        clean_mask = scipy.ndimage.binary_opening(filled_mask, structure=structure, iterations=1)
-        
-        # 5. CONNECTED COMPONENTS
-        labeled_facets, num_features = label(clean_mask)
-        
-        # Filter tiny fragments (< 1.5m^2)
-        # 1 pixel = 0.5 * 0.5 = 0.25m^2. So 6 pixels.
-        min_pixels = 6
-        final_mask = np.zeros_like(clean_mask)
-        
-        component_sizes = np.bincount(labeled_facets.ravel())
-        if len(component_sizes) > 1:
-            valid_labels = np.where(component_sizes > min_pixels)[0]
-            valid_labels = valid_labels[valid_labels > 0] # Exclude background
+        # Iterative Dilation
+        # We assume a max growth of ~40 pixels (20m), which covers most huge roofs.
+        for _ in range(40): 
+            dilated = scipy.ndimage.binary_dilation(grown_mask, structure=structure)
             
-            if len(valid_labels) > 0:
-                final_mask = np.isin(labeled_facets, valid_labels)
+            # The Magic Line: Clip growth to the Lot & Height immediately
+            new_mask = dilated & potential_mask 
+            
+            if np.array_equal(new_mask, grown_mask):
+                break
+            grown_mask = new_mask
 
-        # 6. Edge Cleanup
-        # If the mask spills over the lot line due to 'Closing', re-apply the lot_mask
-        final_mask = final_mask & lot_mask_high
+        # --- 6. CLEANUP ---
+        # Fill holes (skylights) and remove speckles
+        final_mask = scipy.ndimage.binary_fill_holes(grown_mask)
+        final_mask = scipy.ndimage.binary_opening(final_mask, structure=structure, iterations=1)
 
-        return final_mask, nx, ny, nz
+        return final_mask, nx, ny, nz, ndsm
 
     def calculate_irradiance(self, nx, ny, nz, mask):
         """
