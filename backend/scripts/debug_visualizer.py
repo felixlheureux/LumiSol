@@ -145,6 +145,16 @@ def run_visual_test():
 
     # --- SOLAR PHYSICS ---
     print("   -> Calculating Solar Potential...")
+    
+    # DEBUG STATS
+    print(f"   [DEBUG] Total Pixels: {mns_crop.size}")
+    print(f"   [DEBUG] Lot Mask Pixels: {np.sum(lot_mask)}")
+    print(f"   [DEBUG] Elevated (>2m) Pixels: {np.sum(engine.last_is_elevated)}")
+    print(f"   [DEBUG] Slope (<1.3rad) Pixels: {np.sum(engine.last_is_roof_slope)}")
+    print(f"   [DEBUG] Smooth (<0.12) Pixels: {np.sum(engine.last_is_smooth)}")
+    print(f"   [DEBUG] Viable (Combined) Pixels: {np.sum(engine.last_viable_pixels)}")
+    print(f"   [DEBUG] Final Structure Pixels: {np.sum(structures_mask)}")
+
     solar_scores = engine.calculate_irradiance(nx, ny, nz, structures_mask)
     
     # --- PLOTTING ---

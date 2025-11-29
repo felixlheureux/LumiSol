@@ -1,6 +1,6 @@
 import numpy as np
 import scipy.ndimage
-from scipy.ndimage import zoom, label, generate_binary_structure, gaussian_filter
+from scipy.ndimage import zoom, label, generate_binary_structure, gaussian_filter, binary_opening, binary_closing, binary_fill_holes
 from matplotlib import cm
 from io import BytesIO
 import matplotlib.pyplot as plt
@@ -75,30 +75,24 @@ class SolarEngine:
 
     def segment_solar_facets(self, mns, mnt, lot_mask):
         """
-        SCIENTIFIC SEGMENTATION:
-        Identifies 'Viable Solar Facets' instead of generic 'Buildings'.
+        SCIENTIFIC SEGMENTATION (IMPROVED):
+        Optimized for coverage on both Flat (Montreal) and Pitched roofs.
         """
-        # 1. Super-Resolution (Bilinear to preserve planar geometry)
+        # 1. Super-Resolution (Use Order 0 or 1 to avoid "ringing" artifacts on edges)
+        # We use order=1 (Bilinear) for smooth gradients, but we must be careful with mask
         mns_high = zoom(mns, self.upsample_factor, order=1)
         mnt_high = zoom(mnt, self.upsample_factor, order=1)
         
+        # Resize lot mask (Nearest Neighbor to keep it sharp boolean)
         if lot_mask is not None:
              # If mask is already high-res (matches mns_high), use it directly.
             if lot_mask.shape == mns_high.shape:
                 lot_mask_high = lot_mask
             else:
-                # Resize lot mask to match upsampled grid
-                lot_mask_high = zoom(lot_mask, self.upsample_factor, order=0) # Nearest neighbor for bool
-            
-            # DILATION: Expand mask by 1 meter (2 pixels) to catch eaves/overhangs
-            # and account for slight cadastral misalignment.
-            # 1 meter = 2 pixels at 0.5m resolution
-            dilation_struct = generate_binary_structure(2, 2)
-            lot_mask_high = scipy.ndimage.binary_dilation(lot_mask_high, structure=dilation_struct, iterations=2)
+                lot_mask_high = zoom(lot_mask, self.upsample_factor, order=0)
         else:
             lot_mask_high = np.ones_like(mns_high, dtype=bool)
 
-        # Effective cell size
         cell_size = self.raw_resolution / self.upsample_factor
 
         # 2. Physics Calculations
@@ -108,50 +102,64 @@ class SolarEngine:
         
         # 3. DEFINING A "ROOF" (Heuristic Filtering)
         
-        # A. Height Filter: Must be off the ground (> 1.5m)
-        is_elevated = ndsm > 1.5 # Lowered to 1.5m to catch lower eaves
-        print(f"   [DEBUG] Height > 1.5m: {np.sum(is_elevated)} pixels")
-        print(f"   [DEBUG] Height & Lot: {np.sum(is_elevated & lot_mask_high)} pixels")
+        # A. Height Filter: Lowered slightly to catch garages/sheds
+        is_elevated = ndsm > 2.0 
         
-        # B. Slope Filter: 
-        # Exclude Vertical Walls (> 60 deg). Include Flat Roofs.
-        # 60 deg = ~1.04 rad
-        is_roof_slope = (slope < 1.04)
-        print(f"   [DEBUG] Slope < 60 deg: {np.sum(is_roof_slope)} pixels")
-        print(f"   [DEBUG] Slope & Lot: {np.sum(is_roof_slope & lot_mask_high)} pixels")
+        # B. Slope Filter (CRITICAL FIX): 
+        # Allow Flat Roofs (0 deg) up to steep roofs (75 deg = 1.3 rad)
+        # We removed the lower bound (> 0.08) because Montreal has flat roofs!
+        is_roof_slope = slope < 1.3 
         
-        # C. Roughness Filter (Tree Removal):
-        # Calculate local variance of the surface normal Z-component.
-        # Roofs are planar (low variance), Trees are chaotic (high variance).
+        # C. Roughness Filter (Relaxed):
+        # We relax the threshold from 0.05 to 0.12 to allow for shingles/chimneys
         roughness = scipy.ndimage.generic_filter(nz, np.std, size=3)
-        is_smooth = roughness < 0.20 # Relaxed to 0.20 to capture shingles/tiles
-        
+        is_smooth = roughness < 0.12
+
         # Combine Filters
         viable_pixels = is_elevated & is_roof_slope & is_smooth & lot_mask_high
-
-        # 4. MORPHOLOGICAL CLEANING
-        # We skip binary_opening as it can erode valid roof edges.
-        # We rely on Connected Components (min_pixels) to remove noise.
-        clean_mask = viable_pixels
         
-        # 5. CONNECTED COMPONENTS (Facet Extraction)
-        # We label distinct roof planes.
+        # DEBUG: Store for visualization/stats
+        self.last_is_elevated = is_elevated
+        self.last_is_roof_slope = is_roof_slope
+        self.last_is_smooth = is_smooth
+        self.last_viable_pixels = viable_pixels
+
+        # 4. MORPHOLOGICAL CLEANUP (The "Fill" Strategy)
+        
+        # Step A: CLOSING (Connect gaps)
+        # This joins pixels that are close together, fixing the "swiss cheese" effect
+        structure = generate_binary_structure(2, 2) # 8-connectivity
+        closed_mask = binary_closing(viable_pixels, structure=structure, iterations=2)
+        
+        # Step B: FILL HOLES (Solidify)
+        # If we have a ring of valid pixels (e.g., roof edges), fill the inside
+        filled_mask = binary_fill_holes(closed_mask)
+        
+        # Step C: OPENING (Only NOW do we remove noise)
+        # Remove tiny specks that are definitely not roofs
+        # Step C: OPENING (REMOVED)
+        # We removed the opening step to avoid eroding valid roof edges.
+        clean_mask = filled_mask
+        
+        # 5. CONNECTED COMPONENTS
         labeled_facets, num_features = label(clean_mask)
         
-        # Filter tiny fragments (< 2m^2)
-        # 1 pixel = (0.5)^2 = 0.25 m^2. So 2m^2 = 8 pixels.
-        min_pixels = 8 
+        # Filter tiny fragments (< 1.5m^2)
+        # 1 pixel = 0.5 * 0.5 = 0.25m^2. So 6 pixels.
+        min_pixels = 6
         final_mask = np.zeros_like(clean_mask)
         
         component_sizes = np.bincount(labeled_facets.ravel())
-        # Labels start at 1. We need to check if we have any valid components.
         if len(component_sizes) > 1:
             valid_labels = np.where(component_sizes > min_pixels)[0]
-            # Filter out background (0) if it was selected (it shouldn't be by size usually, but valid_labels includes indices)
-            valid_labels = valid_labels[valid_labels > 0]
+            valid_labels = valid_labels[valid_labels > 0] # Exclude background
             
             if len(valid_labels) > 0:
                 final_mask = np.isin(labeled_facets, valid_labels)
+
+        # 6. Edge Cleanup (Optional but Recommended)
+        # If the mask spills over the lot line due to 'Closing', re-apply the lot_mask
+        final_mask = final_mask & lot_mask_high
 
         return final_mask, nx, ny, nz
 

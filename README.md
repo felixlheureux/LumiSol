@@ -37,10 +37,12 @@ LumiSol takes a "Legal-Physics Hybrid" approach. Instead of guessing where a bui
 ### Algorithms: Scientific Physics Engine
 *   **Vector Calculus**: We calculate the 3D Surface Normal (`nx, ny, nz`) and Slope for every pixel using gradient vector analysis.
 *   **Gaussian Smoothing**: A `sigma=0.5` blur is applied before gradient calculation to prevent "stair-step" aliasing and derivative noise from upsampling.
-*   **Facet-Based Segmentation**: Instead of "blob detection", we identify viable solar facets based on strict physical properties:
-    *   **Height**: > 2.0m (Structure)
-    *   **Slope**: < 60° (Pitched/Flat Roof, not wall)
-    *   **Roughness**: Local Standard Deviation of `nz` < 0.10 (Planar surface, not tree)
+*   **Facet-Based Segmentation ("Detect and Fill")**:
+    *   **Strategy**: Instead of eroding noise (which shrinks roofs), we use a **Closing + Fill Holes** morphological strategy to connect fragmented pixels and solidify the roof shape.
+    *   **Criteria**:
+        *   **Height**: > 2.0m (Structure)
+        *   **Slope**: < 1.3 rad (Includes Flat Roofs & Pitched Roofs, excludes Walls)
+        *   **Roughness**: Local Standard Deviation of `nz` < 0.12 (Relaxed for shingles)
 *   **Solar Irradiance**: Calculated using the **Vector Dot Product** between the surface normal and the sun vector (South @ 45° elevation), providing a scientifically accurate efficiency score.
 *   **Strict Legal Alignment**: Uses official Cadastral Polygons to mask LiDAR data, ensuring zero leakage into neighboring properties.
 
