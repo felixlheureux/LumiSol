@@ -78,20 +78,15 @@ class SolarEngine:
         SCIENTIFIC SEGMENTATION (IMPROVED):
         Optimized for coverage on both Flat (Montreal) and Pitched roofs.
         """
-        # 1. Super-Resolution (Use Order 0 or 1 to avoid "ringing" artifacts on edges)
-        # We use order=1 (Bilinear) for smooth gradients, but we must be careful with mask
+        # 1. Super-Resolution (Bilinear to preserve planar geometry)
         mns_high = zoom(mns, self.upsample_factor, order=1)
         mnt_high = zoom(mnt, self.upsample_factor, order=1)
         
         # Resize lot mask (Nearest Neighbor to keep it sharp boolean)
-        if lot_mask is not None:
-             # If mask is already high-res (matches mns_high), use it directly.
-            if lot_mask.shape == mns_high.shape:
-                lot_mask_high = lot_mask
-            else:
-                lot_mask_high = zoom(lot_mask, self.upsample_factor, order=0)
+        if lot_mask is not None and lot_mask.shape != mns_high.shape:
+            lot_mask_high = zoom(lot_mask, self.upsample_factor, order=0)
         else:
-            lot_mask_high = np.ones_like(mns_high, dtype=bool)
+            lot_mask_high = lot_mask if lot_mask is not None else np.ones_like(mns_high, dtype=bool)
 
         cell_size = self.raw_resolution / self.upsample_factor
 
@@ -107,7 +102,7 @@ class SolarEngine:
         
         # B. Slope Filter (CRITICAL FIX): 
         # Allow Flat Roofs (0 deg) up to steep roofs (75 deg = 1.3 rad)
-        # We removed the lower bound (> 0.08) because Montreal has flat roofs!
+        # We REMOVED the lower bound (> 0.08) because Montreal has flat roofs!
         is_roof_slope = slope < 1.3 
         
         # C. Roughness Filter (Relaxed):
@@ -117,29 +112,23 @@ class SolarEngine:
 
         # Combine Filters
         viable_pixels = is_elevated & is_roof_slope & is_smooth & lot_mask_high
-        
-        # DEBUG: Store for visualization/stats
-        self.last_is_elevated = is_elevated
-        self.last_is_roof_slope = is_roof_slope
-        self.last_is_smooth = is_smooth
-        self.last_viable_pixels = viable_pixels
 
         # 4. MORPHOLOGICAL CLEANUP (The "Fill" Strategy)
+        # You need to import these at the top of your file:
+        # from scipy.ndimage import binary_closing, binary_fill_holes, binary_opening
         
         # Step A: CLOSING (Connect gaps)
         # This joins pixels that are close together, fixing the "swiss cheese" effect
         structure = generate_binary_structure(2, 2) # 8-connectivity
-        closed_mask = binary_closing(viable_pixels, structure=structure, iterations=2)
+        closed_mask = scipy.ndimage.binary_closing(viable_pixels, structure=structure, iterations=2)
         
         # Step B: FILL HOLES (Solidify)
         # If we have a ring of valid pixels (e.g., roof edges), fill the inside
-        filled_mask = binary_fill_holes(closed_mask)
+        filled_mask = scipy.ndimage.binary_fill_holes(closed_mask)
         
         # Step C: OPENING (Only NOW do we remove noise)
         # Remove tiny specks that are definitely not roofs
-        # Step C: OPENING (REMOVED)
-        # We removed the opening step to avoid eroding valid roof edges.
-        clean_mask = filled_mask
+        clean_mask = scipy.ndimage.binary_opening(filled_mask, structure=structure, iterations=1)
         
         # 5. CONNECTED COMPONENTS
         labeled_facets, num_features = label(clean_mask)
@@ -157,7 +146,7 @@ class SolarEngine:
             if len(valid_labels) > 0:
                 final_mask = np.isin(labeled_facets, valid_labels)
 
-        # 6. Edge Cleanup (Optional but Recommended)
+        # 6. Edge Cleanup
         # If the mask spills over the lot line due to 'Closing', re-apply the lot_mask
         final_mask = final_mask & lot_mask_high
 

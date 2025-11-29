@@ -146,13 +146,20 @@ def run_visual_test():
     # --- SOLAR PHYSICS ---
     print("   -> Calculating Solar Potential...")
     
-    # DEBUG STATS
-    print(f"   [DEBUG] Total Pixels: {mns_crop.size}")
+    # DEBUG STATS (MASKED BY LOT)
     print(f"   [DEBUG] Lot Mask Pixels: {np.sum(lot_mask)}")
-    print(f"   [DEBUG] Elevated (>2m) Pixels: {np.sum(engine.last_is_elevated)}")
-    print(f"   [DEBUG] Slope (<1.3rad) Pixels: {np.sum(engine.last_is_roof_slope)}")
-    print(f"   [DEBUG] Smooth (<0.12) Pixels: {np.sum(engine.last_is_smooth)}")
-    print(f"   [DEBUG] Viable (Combined) Pixels: {np.sum(engine.last_viable_pixels)}")
+    
+    # We use the stored masks from the engine instance
+    in_lot = lot_mask
+    
+    print(f"   [DEBUG] Elevated (>2m) in Lot: {np.sum(engine.last_is_elevated & in_lot)}")
+    print(f"   [DEBUG] Slope (<1.3rad) in Lot: {np.sum(engine.last_is_roof_slope & in_lot)}")
+    print(f"   [DEBUG] Smooth (<0.12) in Lot: {np.sum(engine.last_is_smooth & in_lot)}")
+    
+    # Intersections
+    print(f"   [DEBUG] Elevated + Slope in Lot: {np.sum(engine.last_is_elevated & engine.last_is_roof_slope & in_lot)}")
+    print(f"   [DEBUG] Elevated + Slope + Smooth in Lot: {np.sum(engine.last_viable_pixels)}") # viable includes lot_mask
+    
     print(f"   [DEBUG] Final Structure Pixels: {np.sum(structures_mask)}")
 
     solar_scores = engine.calculate_irradiance(nx, ny, nz, structures_mask)
