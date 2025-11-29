@@ -91,19 +91,12 @@ class SolarEngine:
 
     def segment_solar_facets(self, mns, mnt, lot_mask):
         """
-        FINAL STRATEGY: 'Seed & Grow' with Lot Constraints.
-        1. SEED: Find the safe, smooth center of the roof.
-        2. CONSTRAINT: Use Lot Mask + nDSM Height as strict walls.
-        3. GROW: Flood-fill the Seed until it hits the Constraint.
+        FINAL STRATEGY: 'Seed & Grow' with Erosion Correction.
         """
         # --- 1. UPSAMPLING & TERRAIN ---
-        # Upsample 1m -> 0.5m for better edge resolution
         mns_high = zoom(mns, self.upsample_factor, order=1)
-        
-        # Dynamic Terrain (Fixes the "2.5m" hill issue)
         mnt_high = self._estimate_terrain(mns_high, window_size_meters=30)
         
-        # Upsample the Lot Mask (Nearest Neighbor to keep it sharp)
         if lot_mask is not None:
             if lot_mask.shape == mns_high.shape:
                 lot_mask_high = lot_mask
@@ -115,23 +108,18 @@ class SolarEngine:
         cell_size = self.raw_resolution / self.upsample_factor
 
         # --- 2. PHYSICS CALCS ---
-        # True Height above ground
         ndsm = mns_high - mnt_high
         ndsm = np.nan_to_num(ndsm, nan=0)
         
         # STRICT MASKING: We only care about the lot's nDSM
-        # This zeros out neighbors so they don't appear in debug or logic
         ndsm = ndsm * lot_mask_high
         
-        # Geometry
         nx, ny, nz, slope = self.calculate_derivatives(mns_high, cell_size)
 
-        # --- 3. THE "SEED" (High Confidence) ---
-        # Find the "Soft Center" of the roof. We can be very strict here.
-        # It must be Flat-ish and Smooth to avoid trees.
+        # --- 3. THE "SEED" (Safe Center) ---
         roughness = scipy.ndimage.generic_filter(nz, np.std, size=3)
         
-        is_high_enough = ndsm > 1.5  # 1.5m allows for sheds/decks
+        is_high_enough = ndsm > 1.5
         is_smooth_core = roughness < 0.12
         is_flat_core = slope < 1.3
         
@@ -144,30 +132,30 @@ class SolarEngine:
         self.last_viable_pixels = seeds
 
         # --- 4. THE "POTENTIAL" (The Container) ---
-        # This defines the maximum possible extent of the roof.
-        # It MUST be high, and it MUST be inside the lot.
-        # We don't care about roughness here (edges are rough).
+        # 1. Create the base container (Height + Legal Lot)
         potential_mask = (ndsm > 1.5) & lot_mask_high
+        
+        # 2. THE FIX: Erode the container to remove "interpolated walls"
+        # This shaves off the 1-pixel "blur" caused by upsampling/wall-scans.
+        # We assume walls are roughly 1-2 pixels thick at this resolution.
+        eroded_potential = scipy.ndimage.binary_erosion(potential_mask, iterations=1)
 
-        # --- 5. GROWTH LOOP (Geodesic Reconstruction) ---
-        # Grow the Seeds until they hit the walls of 'potential_mask'
+        # --- 5. GROWTH LOOP ---
         structure = generate_binary_structure(2, 2)
         grown_mask = seeds.copy()
         
-        # Iterative Dilation
-        # We assume a max growth of ~40 pixels (20m), which covers most huge roofs.
         for _ in range(40): 
             dilated = scipy.ndimage.binary_dilation(grown_mask, structure=structure)
             
-            # The Magic Line: Clip growth to the Lot & Height immediately
-            new_mask = dilated & potential_mask 
+            # Clip growth to the ERODED container
+            # This stops the mask BEFORE it slides down the wall
+            new_mask = dilated & eroded_potential 
             
             if np.array_equal(new_mask, grown_mask):
                 break
             grown_mask = new_mask
 
         # --- 6. CLEANUP ---
-        # Fill holes (skylights) and remove speckles
         final_mask = scipy.ndimage.binary_fill_holes(grown_mask)
         final_mask = scipy.ndimage.binary_opening(final_mask, structure=structure, iterations=1)
 
