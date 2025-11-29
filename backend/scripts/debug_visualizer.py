@@ -73,40 +73,23 @@ def run_visual_test():
         lot_manager = LotManager(CADASTRE_FILE)
         
         # 1. Get Lot Polygon (Projected to LiDAR CRS)
-        real_lot_polygon_proj = lot_manager.get_lot_at_point(target_lat, target_lon, target_crs="EPSG:2950")
+        real_lot_polygon_geom = lot_manager.get_lot_at_point(target_lat, target_lon, target_crs="EPSG:2950")
         
-        if real_lot_polygon_proj:
+        if real_lot_polygon_geom:
             print("      ✅ Found Lot Polygon!")
             
             with rasterio.open(str(LIDAR_FILE)) as src:
-                # 2. Convert Polygon (LiDAR CRS) -> Pixels
-                lot_polygon_pixels = []
-                print(f"      [DEBUG] First Point (Proj): {real_lot_polygon_proj[0]}")
-                for px, py in real_lot_polygon_proj:
-                    col, row = ~src.transform * (px, py)
-                    if len(lot_polygon_pixels) == 0:
-                        print(f"      [DEBUG] First Point (Pixel): col={col}, row={row}")
-                    lot_polygon_pixels.append((col, row))
+                # 2. Get Centroid for Cropping
+                centroid = real_lot_polygon_geom.centroid
+                col, row = ~src.transform * (centroid.x, centroid.y)
+                click_x, click_y = int(col), int(row)
                 
-                lot_polygon = lot_polygon_pixels
-                
-                # 3. Get Center Pixel of the Lot (for cropping)
-                # We can just take the centroid of the polygon pixels
-                poly_cols = [p[0] for p in lot_polygon]
-                poly_rows = [p[1] for p in lot_polygon]
-                click_x = int(sum(poly_cols) / len(poly_cols))
-                click_y = int(sum(poly_rows) / len(poly_rows))
                 print(f"      Center Pixel: {click_x}, {click_y}")
                 
                 # BOUNDS CHECK
                 if not (0 <= click_x < src.width and 0 <= click_y < src.height):
                     print(f"❌ Coordinates {click_x},{click_y} are out of bounds (Image: {src.width}x{src.height}).")
                     return
-
-                print(f"      [DEBUG] Click Projected: {click_x}, {click_y}")
-                print(f"      [DEBUG] Lot Polygon Start: {lot_polygon[0]}")
-                print(f"      [DEBUG] Click Projected: {click_x}, {click_y}")
-                print(f"      [DEBUG] Lot Polygon Start: {lot_polygon[0]}")
 
         else:
             print("      ⚠️ No Lot found at this location.")
@@ -117,10 +100,7 @@ def run_visual_test():
         return
 
     # Run Segmentation (Lot Structures)
-    print("   -> Running 'Lot Structure Segmentation' (Blob Detection)...")
-    
-    # We need to manually crop and prepare data for segment_lot_structures
-    # essentially replicating what segment_roofs does but for the whole lot
+    print("   -> Running 'Scientific Facet Segmentation'...")
     
     # 1. Define Crop Window (Large enough for the lot)
     crop_size = 300 # Bigger crop for whole lot
@@ -131,121 +111,57 @@ def run_visual_test():
     y_min = max(0, click_y - half_size)
     y_max = min(rows, click_y + half_size)
     
-    mns_crop = mns[y_min:y_max, x_min:x_max]
-    mnt_crop = mnt[y_min:y_max, x_min:x_max]
-    
-    # CHECK FOR VALID MNT
-    # If MNT is 0 or nDSM is huge everywhere, we need to generate a synthetic MNT.
-    # We use a morphological opening (minimum filter) to estimate ground.
-    from scipy.ndimage import minimum_filter
-    
-    # Heuristic: If 90% of pixels are > 10m (assuming flat ground is ~0), MNT is likely missing.
-    # Or simpler: If MNT is all zeros.
-    if np.max(mnt_crop) == 0 or np.mean(mns_crop - mnt_crop) > 1000: # 1000m is impossible for nDSM
-        print("      ⚠️ MNT seems invalid or missing. Generating Synthetic MNT (Ground Estimate)...")
-        # Window size should be larger than the largest building (e.g. 20m)
-        # Assuming 1px = 1m (approx)
-        # 2. Define Crop (300x300)
-    # We use a fixed size window around the center
-    crop_size = 300
-    half_size = crop_size // 2
-    
-    # Calculate window bounds
-    window = rasterio.windows.Window(click_x - half_size, click_y - half_size, crop_size, crop_size)
-    
-    # Read Data (Re-open file)
-    # Read Data (Re-open file)
+    # Read Crop
     with rasterio.open(str(LIDAR_FILE)) as src:
+        window = rasterio.windows.Window(x_min, y_min, x_max - x_min, y_max - y_min)
         mns_crop = src.read(1, window=window)
+        transform = src.window_transform(window)
     
     # Handle NoData
     mns_crop = np.nan_to_num(mns_crop, nan=np.nanmin(mns_crop))
     
-    # Generate Synthetic MNT (since we know it's missing/bad)
-    # We generate it at 1m resolution first (faster/smoother)
-    from scipy.ndimage import minimum_filter, gaussian_filter, zoom
+    # Generate Synthetic MNT
+    from scipy.ndimage import minimum_filter, gaussian_filter
     mnt_crop = minimum_filter(mns_crop, size=20)
     mnt_crop = gaussian_filter(mnt_crop, sigma=2)
     
-    # --- UPSCALING (Super-Resolution) ---
-    SUPER_RES_FACTOR = 2 # 2x upscaling (1m -> 0.5m)
+    # --- UPSCALING & MASK CREATION ---
+    SUPER_RES_FACTOR = 2
     print(f"   -> Upscaling Data (Factor: {SUPER_RES_FACTOR}x)...")
     
-    # Use engine's upscaling (Lanczos)
-    mns_crop, mnt_crop = engine.upscale_data(mns_crop, mnt_crop, scale_factor=SUPER_RES_FACTOR)
+    # We need to create the lot mask matching the upscaled dimensions
+    new_transform = transform * transform.scale(0.5, 0.5)
+    upscaled_shape = (mns_crop.shape[0] * SUPER_RES_FACTOR, mns_crop.shape[1] * SUPER_RES_FACTOR)
     
-    print(f"      New Shape: {mns_crop.shape}")
-
-    # Adjust Polygon to Crop Coordinates AND Scale
-    adjusted_polygon = []
-    # Crop origin in global pixels
-    crop_origin_x = click_x - half_size
-    crop_origin_y = click_y - half_size
+    lot_mask = engine.create_lot_mask(real_lot_polygon_geom, upscaled_shape, new_transform)
     
-    for px, py in lot_polygon:
-        # 1. Shift to Crop
-        cx = px - crop_origin_x
-        cy = py - crop_origin_y
-        
-        # 2. Scale
-        cx *= SUPER_RES_FACTOR
-        cy *= SUPER_RES_FACTOR
-        
-        adjusted_polygon.append((cx, cy))
-        
-    lot_mask = engine.create_lot_mask(mns_crop.shape, adjusted_polygon)
-    
-    # 3. Run Segmentation (Strict Legal Boundary)
-    # We use the official lot polygon without any shifting.
-    print("   -> Running Segmentation (Strict Legal Boundary)...")
-    
-    # Use original lot_mask
-    structures_mask, ndsm = engine.segment_lot_structures(mns_crop, mnt_crop, lot_mask)
+    # --- RUN SEGMENTATION ---
+    # segment_solar_facets handles upscaling internally for mns/mnt
+    structures_mask, nx, ny, nz = engine.segment_solar_facets(mns_crop, mnt_crop, lot_mask)
 
     if np.sum(structures_mask) == 0:
         print("❌ No structures found on lot.")
         return
 
-    # --- ALIGNMENT CHECK (Informational Only) ---
-    from scipy.ndimage import center_of_mass
-    # Calculate centroid of the detected structure (in crop pixels)
-    structure_cy, structure_cx = center_of_mass(structures_mask)
-    
-    # Calculate centroid of the lot polygon (in crop pixels)
-    poly_cols = [p[0] for p in adjusted_polygon]
-    poly_rows = [p[1] for p in adjusted_polygon]
-    lot_cx = sum(poly_cols) / len(poly_cols)
-    lot_cy = sum(poly_rows) / len(poly_rows)
-    
-    # Calculate Offset
-    offset_x = structure_cx - lot_cx
-    offset_y = structure_cy - lot_cy
-    offset_dist = np.sqrt(offset_x**2 + offset_y**2)
-    
-    print(f"      [DEBUG] Structure Centroid: {structure_cx:.2f}, {structure_cy:.2f}")
-    print(f"      [DEBUG] Lot Centroid: {lot_cx:.2f}, {lot_cy:.2f}")
-    print(f"      [DEBUG] Alignment Offset: {offset_dist:.2f} pixels")
-    
-    # Run Solar Physics
+    # --- SOLAR PHYSICS ---
     print("   -> Calculating Solar Potential...")
-    # We can just visualize the nDSM and Structure Mask for now
+    solar_scores = engine.calculate_irradiance(nx, ny, nz, structures_mask)
     
     # --- PLOTTING ---
     print("   -> Rendering Plots...")
     fig, axes = plt.subplots(1, 4, figsize=(24, 8))
     
     # Zoom Window (Center 100m x 100m)
-    # Image is 600x600 (0.5m res) -> 300m x 300m
-    # Center is 300, 300
-    # 100m window = 200 pixels
     zoom_half = 100 # pixels (50m)
-    center_x = mns_crop.shape[1] // 2
-    center_y = mns_crop.shape[0] // 2
+    center_x = structures_mask.shape[1] // 2
+    center_y = structures_mask.shape[0] // 2
     x_min, x_max = center_x - zoom_half, center_x + zoom_half
     y_min, y_max = center_y - zoom_half, center_y + zoom_half
     
-    # 1. MNS (Surface)
-    axes[0].imshow(mns_crop, cmap='terrain')
+    # 1. MNS (Surface) - Upscaled
+    # We need to upscale mns_crop manually for visualization to match mask
+    mns_high = zoom(mns_crop, SUPER_RES_FACTOR, order=1)
+    axes[0].imshow(mns_high, cmap='terrain')
     axes[0].set_title("LiDAR Surface (MNS)")
     axes[0].set_xlim(x_min, x_max)
     axes[0].set_ylim(y_max, y_min) # Invert Y for image coords
@@ -256,15 +172,15 @@ def run_visual_test():
     axes[1].set_xlim(x_min, x_max)
     axes[1].set_ylim(y_max, y_min)
     
-    # 3. nDSM (Height)
-    axes[2].imshow(ndsm, cmap='jet', vmin=0, vmax=10)
-    axes[2].set_title("Normalized Height (nDSM)")
+    # 3. Solar Scores (Heatmap)
+    axes[2].imshow(solar_scores, cmap='inferno')
+    axes[2].set_title("Solar Irradiance (Heatmap)")
     axes[2].set_xlim(x_min, x_max)
     axes[2].set_ylim(y_max, y_min)
     
     # 4. Final Structure Segmentation
     axes[3].imshow(structures_mask, cmap='prism', interpolation='nearest')
-    axes[3].set_title("Detected Structures")
+    axes[3].set_title("Detected Facets")
     axes[3].set_xlim(x_min, x_max)
     axes[3].set_ylim(y_max, y_min)
 

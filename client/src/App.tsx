@@ -64,10 +64,10 @@ export default function App() {
   const [selectedPoint, setSelectedPoint] = useState<{ lat: number; lon: number } | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisResult, setAnalysisResult] = useState<{
-    heatmap_b64: string;
-    bounds: [number, number, number, number];
-    solar_potential: number;
-    area_sqm: number;
+    heatmap: string; // Full Data URI
+    bounds: [[number, number], [number, number]]; // [[w, s], [e, n]]
+    solar_potential: string; // "1234 kWh/yr"
+    area: string; // "123 m²"
     lot_polygon: [number, number][];
   } | null>(null);
 
@@ -212,13 +212,13 @@ export default function App() {
                   Total Lot Potential
                 </h3>
                 <div style={{ fontSize: '2.2rem', fontWeight: 700, color: '#1a9641', lineHeight: 1 }}>
-                  {analysisResult.solar_potential.toLocaleString()} <span style={{ fontSize: '1rem', color: '#666' }}>kWh</span>
+                  {analysisResult.solar_potential}
                 </div>
                 
                 <div style={{ display: 'flex', gap: '15px', marginTop: '15px', fontSize: '0.85rem' }}>
                   <div>
                     <div style={{ color: '#888' }}>Total Area</div>
-                    <div style={{ fontWeight: 600 }}>{analysisResult.area_sqm} m²</div>
+                    <div style={{ color: '#888',fontWeight: 600 }}>{analysisResult.area}</div>
                   </div>
                 </div>
               </div>
@@ -266,12 +266,12 @@ export default function App() {
             <Source
               id="solar-result"
               type="image"
-              url={analysisResult.heatmap_b64}
+              url={analysisResult.heatmap}
               coordinates={[
-                [analysisResult.bounds[0], analysisResult.bounds[3]], // Top Left
-                [analysisResult.bounds[2], analysisResult.bounds[3]], // Top Right
-                [analysisResult.bounds[2], analysisResult.bounds[1]], // Bottom Right
-                [analysisResult.bounds[0], analysisResult.bounds[1]], // Bottom Left
+                [analysisResult.bounds[0][0], analysisResult.bounds[1][1]], // Top Left (West, North)
+                [analysisResult.bounds[1][0], analysisResult.bounds[1][1]], // Top Right (East, North)
+                [analysisResult.bounds[1][0], analysisResult.bounds[0][1]], // Bottom Right (East, South)
+                [analysisResult.bounds[0][0], analysisResult.bounds[0][1]], // Bottom Left (West, South)
               ]}
             >
               <Layer

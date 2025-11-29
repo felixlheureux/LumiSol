@@ -89,6 +89,12 @@ class SolarEngine:
             else:
                 # Resize lot mask to match upsampled grid
                 lot_mask_high = zoom(lot_mask, self.upsample_factor, order=0) # Nearest neighbor for bool
+            
+            # DILATION: Expand mask by 1 meter (2 pixels) to catch eaves/overhangs
+            # and account for slight cadastral misalignment.
+            # 1 meter = 2 pixels at 0.5m resolution
+            dilation_struct = generate_binary_structure(2, 2)
+            lot_mask_high = scipy.ndimage.binary_dilation(lot_mask_high, structure=dilation_struct, iterations=2)
         else:
             lot_mask_high = np.ones_like(mns_high, dtype=bool)
 
@@ -102,28 +108,31 @@ class SolarEngine:
         
         # 3. DEFINING A "ROOF" (Heuristic Filtering)
         
-        # A. Height Filter: Must be off the ground (> 2.5m)
-        is_elevated = ndsm > 2.5
+        # A. Height Filter: Must be off the ground (> 1.5m)
+        is_elevated = ndsm > 1.5 # Lowered to 1.5m to catch lower eaves
+        print(f"   [DEBUG] Height > 1.5m: {np.sum(is_elevated)} pixels")
+        print(f"   [DEBUG] Height & Lot: {np.sum(is_elevated & lot_mask_high)} pixels")
         
         # B. Slope Filter: 
-        # Exclude Flat Ground (< 5 deg) and Vertical Walls (> 60 deg)
-        # 5 deg = 0.087 rad, 60 deg = 1.047 rad
-        is_roof_slope = (slope > 0.08) & (slope < 1.05)
+        # Exclude Vertical Walls (> 60 deg). Include Flat Roofs.
+        # 60 deg = ~1.04 rad
+        is_roof_slope = (slope < 1.04)
+        print(f"   [DEBUG] Slope < 60 deg: {np.sum(is_roof_slope)} pixels")
+        print(f"   [DEBUG] Slope & Lot: {np.sum(is_roof_slope & lot_mask_high)} pixels")
         
         # C. Roughness Filter (Tree Removal):
         # Calculate local variance of the surface normal Z-component.
         # Roofs are planar (low variance), Trees are chaotic (high variance).
         roughness = scipy.ndimage.generic_filter(nz, np.std, size=3)
-        is_smooth = roughness < 0.05
-
+        is_smooth = roughness < 0.20 # Relaxed to 0.20 to capture shingles/tiles
+        
         # Combine Filters
         viable_pixels = is_elevated & is_roof_slope & is_smooth & lot_mask_high
 
         # 4. MORPHOLOGICAL CLEANING
-        # Remove "Salt and Pepper" noise (leaves, chimneys)
-        # Opening = Erosion followed by Dilation
-        structure = generate_binary_structure(2, 2)
-        clean_mask = scipy.ndimage.binary_opening(viable_pixels, structure=structure)
+        # We skip binary_opening as it can erode valid roof edges.
+        # We rely on Connected Components (min_pixels) to remove noise.
+        clean_mask = viable_pixels
         
         # 5. CONNECTED COMPONENTS (Facet Extraction)
         # We label distinct roof planes.

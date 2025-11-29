@@ -34,11 +34,15 @@ LumiSol takes a "Legal-Physics Hybrid" approach. Instead of guessing where a bui
 *   **Spatial Database**: GeoPackage (`.gpkg`) queried via GeoPandas / Shapely
 *   **Physics Engine**: Rasterio, NumPy, SciPy (ndimage)
 
-### Algorithms
-*   **Super-Resolution**: Lanczos upsampling (2x) of 1m LiDAR grids to 0.5m resolution. This preserves sharp roof edges better than standard cubic interpolation.
+### Algorithms: Scientific Physics Engine
+*   **Vector Calculus**: We calculate the 3D Surface Normal (`nx, ny, nz`) and Slope for every pixel using gradient vector analysis.
+*   **Gaussian Smoothing**: A `sigma=0.5` blur is applied before gradient calculation to prevent "stair-step" aliasing and derivative noise from upsampling.
+*   **Facet-Based Segmentation**: Instead of "blob detection", we identify viable solar facets based on strict physical properties:
+    *   **Height**: > 2.0m (Structure)
+    *   **Slope**: < 60° (Pitched/Flat Roof, not wall)
+    *   **Roughness**: Local Standard Deviation of `nz` < 0.10 (Planar surface, not tree)
+*   **Solar Irradiance**: Calculated using the **Vector Dot Product** between the surface normal and the sun vector (South @ 45° elevation), providing a scientifically accurate efficiency score.
 *   **Strict Legal Alignment**: Uses official Cadastral Polygons to mask LiDAR data, ensuring zero leakage into neighboring properties.
-*   **Dynamic Roughness Filtering**: Uses Laplacian filters and Isodata thresholding to distinguish smooth roofs from rough trees.
-*   **Morphological Cleanup**: Applies Opening and Closing operations to remove noise (salt-and-pepper) and fill small holes in detected structures.
 
 ## 📂 Project Structure
 
