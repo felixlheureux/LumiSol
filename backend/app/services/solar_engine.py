@@ -92,27 +92,20 @@ class SolarEngine:
 
     def segment_solar_facets(self, mns, mnt, lot_mask):
         """
-        PRODUCTION SEGMENTATION:
-        1. Bilateral Filter (Sharpen Edges / Smooth Noise).
-        2. Marker-Controlled Watershed (Topological Segmentation).
-        3. Douglas-Peucker Regularization (Vector Simplification).
+        OBJECT-BASED SEGMENTATION (OBIA):
+        1. Capture ALL high objects (Hysteresis Thresholding).
+        2. Classify entire objects as 'Roof' or 'Tree' based on aggregate stats.
+        3. 'Shave' the walls at the very end.
         """
-        # --- 1. UPSAMPLING & PRE-PROCESSING ---
+        # --- 1. PRE-PROCESSING ---
+        # Upsample 1m -> 0.5m for better resolution
         mns_high = zoom(mns, self.upsample_factor, order=1)
+        # Use simple terrain resize (we trust input MNT or use a flat plane if needed)
+        mnt_high = zoom(mnt, self.upsample_factor, order=1)
         
-        # [NEW] Bilateral Filter
-        # This is the "Magic Sauce". It smooths texture (shingles) but PRESERVES edges.
-        # d=5: Look at 5 pixel neighborhood
-        # sigmaColor=0.5: Only mix pixels if height diff < 0.5m (Preserves walls)
-        # sigmaSpace=75: Smooth broad flat areas
-        mns_high = mns_high.astype(np.float32)
-        mns_high = cv2.bilateralFilter(mns_high, d=5, sigmaColor=0.5, sigmaSpace=75)
-
-        # Dynamic Terrain
-        mnt_high = self._estimate_terrain(mns_high, window_size_meters=30)
-        
-        # Lot Mask
+        # Resize Lot Mask
         if lot_mask is not None:
+             # Nearest Neighbor for boolean mask
             if lot_mask.shape == mns_high.shape:
                 lot_mask_high = lot_mask
             else:
@@ -122,7 +115,7 @@ class SolarEngine:
 
         cell_size = self.raw_resolution / self.upsample_factor
 
-        # --- 2. PHYSICS CALCS ---
+        # --- 2. PHYSICS ---
         ndsm = mns_high - mnt_high
         ndsm = np.nan_to_num(ndsm, nan=0)
         
@@ -130,60 +123,78 @@ class SolarEngine:
         ndsm = ndsm * lot_mask_high
         
         nx, ny, nz, slope = self.calculate_derivatives(mns_high, cell_size)
-
-        # --- 3. WATERSHED MARKERS ---
-        # Foreground: Strict Roof (High, Flat, Smooth)
-        roughness = scipy.ndimage.generic_filter(nz, np.std, size=3)
-        sure_roof = (ndsm > 1.5) & (slope < 1.0) & (roughness < 0.12) & lot_mask_high
-        sure_roof = scipy.ndimage.binary_opening(sure_roof, structure=np.ones((3,3)))
         
+        # Calculate Roughness (Standard Deviation of Z-Normal)
+        # We will use this later to judge the whole blob
+        roughness_map = scipy.ndimage.generic_filter(nz, np.std, size=3)
+
+        # --- 3. HYSTERESIS THRESHOLDING (Capture the Shape) ---
+        # We use two height thresholds to be safe.
+        
+        # A. CORE (Strong): Definitely a structure (Height > 2.0m)
+        core_mask = (ndsm > 2.0) & lot_mask_high
+        
+        # B. BASIN (Weak): Could be a porch, garage, or edge (Height > 0.8m)
+        # We go very low (0.8m) because we will filter out noise later.
+        basin_mask = (ndsm > 0.8) & lot_mask_high
+        
+        # C. RECONSTRUCTION: Grow the Core into the Basin
+        # This gives us the "Perfect DSM Shape" you saw, connected to at least one high point.
+        # It removes floating trash (bushes) that are only 1m high but have no 2m core.
+        structure = generate_binary_structure(2, 2)
+        object_mask = scipy.ndimage.binary_dilation(core_mask, mask=basin_mask, iterations=-1, structure=structure)
+
+        # --- 4. OBJECT CLASSIFICATION (The "Brain") ---
+        # Now we look at each blob and decide: House or Tree?
+        
+        labeled_blobs, num_blobs = label(object_mask, structure=structure)
+        
+        # We will build a new "Clean" mask
+        final_mask = np.zeros_like(object_mask)
+        
+        # Get indices of all pixels
+        # We loop through objects (1 to N). This is fast for < 100 objects.
+        for i in range(1, num_blobs + 1):
+            blob_indices = (labeled_blobs == i)
+            
+            # --- METRIC 1: Size ---
+            # Remove tiny noise (< 2m^2 -> 8 pixels)
+            if np.sum(blob_indices) < 8:
+                continue
+                
+            # --- METRIC 2: Roughness ---
+            # Calculate the AVERAGE roughness of this entire blob.
+            # Trees are chaotic everywhere. Roofs are smooth mostly.
+            avg_roughness = np.mean(roughness_map[blob_indices])
+            
+            # Threshold: 0.12 is a good cutoff. 
+            # Trees are usually > 0.20. Roofs are usually < 0.05.
+            if avg_roughness > 0.12:
+                continue # It's a Tree -> Delete it.
+                
+            # --- METRIC 3: Wall Artifacts ---
+            # If the blob is mostly vertical (Average slope > 1.0 rad), it's a wall/fence.
+            avg_slope = np.mean(slope[blob_indices])
+            if avg_slope > 1.2:
+                continue # It's a Wall -> Delete it.
+
+            # If it passed all tests, it's a Roof. Keep it.
+            final_mask[blob_indices] = 1
+            
         # DEBUG: Store for visualization/stats
-        self.last_is_elevated = (ndsm > 1.5)
-        self.last_is_roof_slope = (slope < 1.0)
-        self.last_is_smooth = (roughness < 0.12)
-        self.last_viable_pixels = sure_roof
+        self.last_is_elevated = object_mask
+        self.last_is_roof_slope = (slope < 1.2) # Approximation for debug
+        self.last_is_smooth = (roughness_map < 0.12) # Approximation for debug
+        self.last_viable_pixels = final_mask
 
-        # Background: Ground (Low or Steep)
-        # We dilate the roof to create a "Safety Zone" (Unknown Region)
-        # The watershed will fight inside this zone.
-        sure_bg_area = scipy.ndimage.binary_dilation(sure_roof, iterations=5)
-        sure_ground = ~sure_bg_area
+        # --- 5. EDGE POLISHING ---
+        # Since we used a low threshold (>0.8m), we captured the walls.
+        # We simply erode the mask by 1 pixel (0.5m) to "shave" the walls off.
+        final_mask = scipy.ndimage.binary_erosion(final_mask, structure=structure, iterations=1)
         
-        # Markers for OpenCV (0=Unknown, 1=Ground, 2+=Roofs)
-        markers = np.zeros_like(ndsm, dtype=np.int32)
-        markers[sure_ground] = 1
-        roof_blobs, _ = label(sure_roof)
-        markers[roof_blobs > 0] = roof_blobs[roof_blobs > 0] + 1 
-        
-        # Watershed
-        # Normalize nDSM for the algorithm
-        ndsm_vis = cv2.normalize(ndsm, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        ndsm_color = cv2.cvtColor(ndsm_vis, cv2.COLOR_GRAY2BGR)
-        cv2.watershed(ndsm_color, markers)
-        
-        raw_mask = (markers > 1) & lot_mask_high
+        # Fill internal holes (Skylights)
+        final_mask = scipy.ndimage.binary_fill_holes(final_mask)
 
-        # --- 4. [NEW] EDGE REFINEMENT (Regularization) ---
-        # Convert the pixelated "Staircase" mask into a Clean Polygon
-        final_mask = np.zeros_like(raw_mask, dtype=np.uint8)
-        
-        # Find contours of the rough mask
-        contours, _ = cv2.findContours(raw_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for cnt in contours:
-            # Calculate Perimeter
-            peri = cv2.arcLength(cnt, True)
-            
-            # Douglas-Peucker Approximation
-            # epsilon is the "Error Tolerance".
-            # 1% of perimeter is usually enough to snap jagged pixels to a straight line
-            # without losing the shape of the house.
-            epsilon = 0.01 * peri 
-            approx = cv2.approxPolyDP(cnt, epsilon, True)
-            
-            # Draw the simplified polygon
-            cv2.drawContours(final_mask, [approx], -1, 1, thickness=cv2.FILLED)
-            
         return final_mask.astype(bool), nx, ny, nz, ndsm
 
     def calculate_irradiance(self, nx, ny, nz, mask):
