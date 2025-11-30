@@ -178,6 +178,7 @@ class SolarEngine:
         # We use a Slope/Edge map which looks like a technical drawing.
         texture_gray = self.generate_shadowless_texture(mns_high)
         
+        
         # 2. Find the "Prompt" (The Seed)
         # We don't need a perfect segmentation, just ONE valid pixel.
         # Find the highest point in the lot (most likely the roof peak)
