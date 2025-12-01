@@ -19,6 +19,8 @@
 
 # 1.4 Data Files (Large Assets)
 /backend/data/raw/
+/backend/data/processed/
+/backend/data/mask2former_data/
 
 # AI Model Weights and Output (Large Binary Files)
 /backend/*.pt      # MobileSAM Model Weights (best.pt, mobile_sam.pt)
