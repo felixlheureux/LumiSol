@@ -10,6 +10,7 @@
 /backend/dist/
 /backend/build/
 /backend/app/**/__pycache__/
+/backend/**/__pycache__/
 /backend/scripts/__pycache__/
 /backend/.pycache/
 .pycache/
