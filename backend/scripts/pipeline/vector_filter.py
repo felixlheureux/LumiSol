@@ -9,7 +9,7 @@ import os
 class VectorFilter:
     def __init__(self, config):
         self.config = config
-        self.montreal_bbox = box(-73.9, 45.4, -73.5, 45.7)
+        self.montreal_bbox = box(-74.05, 45.35, -73.4, 45.8)
 
     def run(self):
         print(f"🚀 Starting Smart Vector Filtering...")
@@ -21,25 +21,15 @@ class VectorFilter:
 
         start_time = time.time()
 
-        # 1. Load Vectors with BBOX Filter (Montreal Region)
-        print("1. Loading Montreal Vectors...")
         try:
-            # Peek CRS to project BBOX
-            meta = gpd.read_file(self.config['INPUT_VECTOR_PATH'], rows=1)
-            source_crs = meta.crs
-            
-            bbox_gdf = gpd.GeoDataFrame({'geometry': [self.montreal_bbox]}, crs="EPSG:4326")
-            if source_crs and source_crs != "EPSG:4326":
-                bbox_gdf = bbox_gdf.to_crs(source_crs)
-            
-            target_bbox = bbox_gdf.geometry.iloc[0].bounds
-            
-            # Load all buildings in Montreal
-            buildings = gpd.read_file(self.config['INPUT_VECTOR_PATH'], bbox=target_bbox)
-            print(f"   ✅ Loaded {len(buildings)} buildings in Montreal region.")
+            # 1. Load ALL Vectors (Quebec-wide)
+            print("1. Loading All Vectors...")
+            # Load all buildings (no bbox filter)
+            buildings = gpd.read_file(self.config['INPUT_VECTOR_PATH'])
+            print(f"   ✅ Loaded {len(buildings)} buildings (Quebec-wide).")
             
             if buildings.empty:
-                print("   ⚠️ Warning: No buildings found in this region.")
+                print("   ⚠️ Warning: No buildings found.")
                 return
 
             # 2. Load LiDAR Index
@@ -61,6 +51,18 @@ class VectorFilter:
             valid_indices = tile_counts['index'].tolist()
             print(f"   Found {len(valid_indices)} valid tiles with buildings.")
 
+            # Identify Montreal Tiles for prioritization
+            # Project Montreal BBOX to match lidar index
+            bbox_gdf = gpd.GeoDataFrame({'geometry': [self.montreal_bbox]}, crs="EPSG:4326")
+            if bbox_gdf.crs != lidar_index.crs:
+                bbox_gdf = bbox_gdf.to_crs(lidar_index.crs)
+            
+            montreal_geom = bbox_gdf.geometry.iloc[0]
+            montreal_tiles = lidar_index[lidar_index.intersects(montreal_geom)].index.tolist()
+            valid_montreal_tiles = list(set(montreal_tiles).intersection(set(valid_indices)))
+            
+            print(f"   Found {len(valid_montreal_tiles)} valid tiles in Montreal region.")
+
             # Stratified Sampling
             high = tile_counts[tile_counts['count'] > 2000]['index'].tolist()
             med = tile_counts[(tile_counts['count'] >= 200) & (tile_counts['count'] <= 2000)]['index'].tolist()
@@ -71,7 +73,14 @@ class VectorFilter:
             random.seed(self.config['RANDOM_SEED'])
             selected_indices = set()
             
-            remaining_needed = self.config['MAX_TILES']
+            # 1. Force Select 3 Montreal Tiles (if available)
+            target_montreal = 3
+            if valid_montreal_tiles:
+                selected_indices.update(random.sample(valid_montreal_tiles, min(len(valid_montreal_tiles), target_montreal)))
+                print(f"   Selected {len(selected_indices)} Montreal tiles.")
+            
+            # 2. Fill the rest from Global Pools
+            remaining_needed = self.config['MAX_TILES'] - len(selected_indices)
             target_per_cat = max(1, remaining_needed // 3)
             
             def pick_new(pool, n):
@@ -87,7 +96,7 @@ class VectorFilter:
                 all_avail = set(valid_indices) - selected_indices
                 selected_indices.update(random.sample(list(all_avail), min(len(all_avail), still_needed)))
                 
-            print(f"   🎯 Selected {len(selected_indices)} tiles.")
+            print(f"   🎯 Selected {len(selected_indices)} tiles total.")
 
             # 4. Save Selected Tiles Metadata
             selected_tiles_data = []

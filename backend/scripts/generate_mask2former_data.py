@@ -25,24 +25,41 @@ CONFIG = {
     "RANDOM_SEED": 42
 }
 
+import argparse
+
 def main():
+    parser = argparse.ArgumentParser(description="Mask2Former Data Generation Pipeline")
+    parser.add_argument("--skip-vectors", action="store_true", help="Skip Step 1: Vector Filtering & Tile Selection")
+    parser.add_argument("--skip-download", action="store_true", help="Skip Step 2: LiDAR Downloading")
+    parser.add_argument("--skip-generation", action="store_true", help="Skip Step 3: Data Generation")
+    args = parser.parse_args()
+
     print("🚀 Starting Mask2Former Data Generation Pipeline")
     print("===============================================")
     
     # 1. Filter Vectors & Select Tiles
-    print("\n[Step 1/3] Filtering Vectors & Selecting Tiles")
-    vector_filter = VectorFilter(CONFIG)
-    vector_filter.run()
+    if not args.skip_vectors:
+        print("\n[Step 1/3] Filtering Vectors & Selecting Tiles")
+        vector_filter = VectorFilter(CONFIG)
+        vector_filter.run()
+    else:
+        print("\n[Step 1/3] Skipping Vector Filtering...")
     
     # 2. Download LiDAR
-    print("\n[Step 2/3] Downloading LiDAR Tiles")
-    downloader = LidarDownloader(CONFIG)
-    downloader.run()
+    if not args.skip_download:
+        print("\n[Step 2/3] Downloading LiDAR Tiles")
+        downloader = LidarDownloader(CONFIG)
+        downloader.run()
+    else:
+        print("\n[Step 2/3] Skipping LiDAR Download...")
     
     # 3. Generate Data
-    print("\n[Step 3/3] Generating Training Data")
-    generator = DataGenerator(CONFIG)
-    generator.run()
+    if not args.skip_generation:
+        print("\n[Step 3/3] Generating Training Data")
+        generator = DataGenerator(CONFIG)
+        generator.run()
+    else:
+        print("\n[Step 3/3] Skipping Data Generation...")
     
     print("\n✅ Pipeline Complete!")
 
