@@ -10,7 +10,7 @@ from transformers import TrainingArguments, Trainer
 import evaluate
 
 # --- CONFIGURATION ---
-DATA_DIR = "data/processed/mask2former_lidar_only" # Make sure this matches your generator output
+DATA_DIR = "data/processed/mask2former_data" # Make sure this matches your generator output
 MODEL_CHECKPOINT = "facebook/mask2former-swin-tiny-coco-instance"
 OUTPUT_MODEL_DIR = "models/solar_mask2former_lidar"
 BATCH_SIZE = 2 
@@ -130,7 +130,12 @@ def main():
     print(f"   Data: {DATA_DIR}")
 
     # 1. Setup Processor
-    processor = Mask2FormerImageProcessor.from_pretrained(MODEL_CHECKPOINT)
+    # Initialize the processor with normalization turned off, or calculate your own dataset statistics.
+    processor = Mask2FormerImageProcessor.from_pretrained(
+        MODEL_CHECKPOINT,
+        do_normalize=False, # Important: Don't use RGB stats on Physics data
+        # Alternatively, if do_normalize=True, manually set image_mean=[0.5, 0.5, 0.5] etc.
+    )
     
     # 2. Setup Dataset
     full_dataset = SolarInstanceDataset(f"{DATA_DIR}/images", f"{DATA_DIR}/masks", processor)
@@ -155,7 +160,11 @@ def main():
         max_epochs=EPOCHS, 
         accelerator="auto", # Uses GPU (MPS on Mac, CUDA on Nvidia) automatically
         log_every_n_steps=5,
-        default_root_dir="logs_mask2former"
+        default_root_dir="logs_mask2former",
+        
+        # ADD THESE:
+        accumulate_grad_batches=4, # Simulates Batch Size = 2 * 4 = 8
+        precision="16-mixed",      # Reduces VRAM usage, speeds up training
     )
     
     print("🚀 Starting Training...")

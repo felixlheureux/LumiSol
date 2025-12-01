@@ -11,17 +11,14 @@
 /backend/build/
 /backend/app/**/__pycache__/
 /backend/scripts/__pycache__/
+/backend/.pycache/
+.pycache/
 
 # 1.3 Dependency Lockfiles (The result of 'uv init' / 'uv add')
 /backend/uv.lock # <- This is the Python lockfile. MUST BE COMMITTED.
 
 # 1.4 Data Files (Large Assets)
-/backend/data/*.tif
-/backend/data/*.gpkg
-/backend/data/*.geojson
-/backend/data/*.pmtiles
-/backend/data/*.las
-/backend/data/*.laz
+/backend/data/raw/
 
 # AI Model Weights and Output (Large Binary Files)
 /backend/*.pt      # MobileSAM Model Weights (best.pt, mobile_sam.pt)
