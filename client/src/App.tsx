@@ -59,19 +59,23 @@ export default function App() {
 
   // 2. Settings State
   const [mapProvider, setMapProvider] = useState<ProviderKey>('google');
+  const [layerOpacity, setLayerOpacity] = useState(0.8); // New: Control Heatmap Opacity
 
   // 3. Analysis State
   const [selectedPoint, setSelectedPoint] = useState<{ lat: number; lon: number } | null>(null);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+  const [errorMessage, setErrorMessage] = useState('');
+  
   const [analysisResult, setAnalysisResult] = useState<{
     heatmap: string; // Full Data URI
     bounds: [[number, number], [number, number]]; // [[w, s], [e, n]]
     solar_potential: string; // "1234 kWh/yr"
     area: string; // "123 m²"
     lot_polygon: [number, number][];
+    graph_data: { date: string; kwh: number }[];
   } | null>(null);
 
-  // 4. Dynamic Map Style Construction
+  // 4. Dynamic Map Style
   const mapStyle = useMemo(() => {
     const current = PROVIDERS[mapProvider];
     return {
@@ -92,18 +96,19 @@ export default function App() {
           source: 'satellite-source',
           paint: {
             'raster-opacity': 1.0,
-            'raster-saturation': mapProvider === 'google' ? -0.2 : 0, // Desaturate Google slightly
+            'raster-saturation': mapProvider === 'google' ? -0.2 : 0, 
           },
         },
       ],
     };
   }, [mapProvider]);
 
-  // 5. Shared Analysis Logic
+  // 5. Analysis Logic
   const runAnalysis = useCallback(async (lat: number, lon: number) => {
     setSelectedPoint({ lat, lon });
     setAnalysisResult(null);
-    setIsAnalyzing(true);
+    setStatus('loading');
+    setErrorMessage('');
 
     try {
       // Call the Python Backend
@@ -113,18 +118,21 @@ export default function App() {
         body: JSON.stringify({ lat, lon }),
       });
 
-      if (!response.ok) throw new Error('Analysis failed');
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Unknown Error' }));
+        throw new Error(errorData.detail || `Error ${response.status}`);
+      }
+
       const data = await response.json();
       setAnalysisResult(data);
-    } catch (error) {
-      console.error('Error analyzing roof:', error);
-      alert('Could not analyze this location. Is the backend running?');
-    } finally {
-      setIsAnalyzing(false);
+      setStatus('success');
+    } catch (error: any) {
+      console.error('Analysis error:', error);
+      setStatus('error');
+      setErrorMessage(error.message || 'Could not connect to backend.');
     }
   }, []);
 
-  // 6. Address Selection Handler
   const handleAddressSelect = (lat: number, lon: number) => {
     if (mapRef.current) {
       mapRef.current.flyTo({
@@ -133,11 +141,9 @@ export default function App() {
         duration: 2000,
       });
     }
-    // Auto-trigger analysis
     runAnalysis(lat, lon);
   };
 
-  // 7. Map Click Handler
   const onMapClick = useCallback((event: MapLayerMouseEvent) => {
     const { lng, lat } = event.lngLat;
     runAnalysis(lat, lng);
@@ -169,6 +175,9 @@ export default function App() {
             <h1 style={{ margin: 0, fontSize: '1.4rem', color: '#333', fontWeight: 800 }}>
               LumiSol <span style={{ color: '#ff9900' }}>Live</span>
             </h1>
+            <div style={{fontSize: '0.7rem', background: '#eee', padding: '2px 6px', borderRadius: '4px', color: '#666'}}>
+                v2.0 Beta
+            </div>
           </div>
 
           <AddressAutocomplete onSelect={handleAddressSelect} />
@@ -201,15 +210,21 @@ export default function App() {
 
           {/* DYNAMIC RESULTS SECTION */}
           <div style={{ marginTop: '20px', borderTop: '1px solid #eee', paddingTop: '15px' }}>
-            {isAnalyzing ? (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#ff9900' }}>
+            {status === 'loading' ? (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px', color: '#ff9900', padding: '20px 0' }}>
                 <div className="spinner" />
-                <span style={{ fontWeight: 600 }}>Scanning Lot...</span>
+                <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>Analyzing LiDAR Data...</span>
+                <span style={{ fontSize: '0.8rem', color: '#888' }}>Checking height, slope & azimuth</span>
               </div>
+            ) : status === 'error' ? (
+                <div style={{ color: '#d32f2f', background: '#ffebee', padding: '10px', borderRadius: '8px', fontSize: '0.9rem' }}>
+                    <strong>Analysis Failed</strong>
+                    <p style={{margin: '5px 0 0 0', fontSize: '0.8rem'}}>{errorMessage}</p>
+                </div>
             ) : analysisResult ? (
               <div>
                 <h3 style={{ margin: '0 0 5px 0', fontSize: '0.85rem', textTransform: 'uppercase', color: '#888' }}>
-                  Total Lot Potential
+                  Solar Potential
                 </h3>
                 <div style={{ fontSize: '2.2rem', fontWeight: 700, color: '#1a9641', lineHeight: 1 }}>
                   {analysisResult.solar_potential}
@@ -217,14 +232,52 @@ export default function App() {
                 
                 <div style={{ display: 'flex', gap: '15px', marginTop: '15px', fontSize: '0.85rem' }}>
                   <div>
-                    <div style={{ color: '#888' }}>Total Area</div>
-                    <div style={{ color: '#888',fontWeight: 600 }}>{analysisResult.area}</div>
+                    <div style={{ color: '#888' }}>Roof Area</div>
+                    <div style={{ color: '#333', fontWeight: 600, fontSize: '1.1rem' }}>{analysisResult.area}</div>
                   </div>
+                </div>
+
+                {/* The Graph */}
+                <div style={{ marginTop: '20px', height: '180px' }}>
+                  <h4 style={{ margin: '0 0 10px 0', fontSize: '0.8rem', color: '#666' }}>
+                    Daily Production (Last 365 Days)
+                  </h4>
+                  
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={analysisResult.graph_data}>
+                      <XAxis 
+                        dataKey="date" 
+                        hide={true} // Hide dates to keep it clean
+                      />
+                      <Tooltip 
+                        contentStyle={{ background: '#333', border: 'none', color: '#fff', fontSize: '12px' }}
+                        cursor={{fill: 'rgba(0,0,0,0.1)'}}
+                        formatter={(val: number) => [`${val} kWh`, 'Energy']}
+                        labelFormatter={(label: string) => new Date(label).toLocaleDateString()}
+                      />
+                      <Bar dataKey="kwh" fill="#ff9900" radius={[2, 2, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+
+                {/* Opacity Slider */}
+                <div style={{ marginTop: '20px' }}>
+                    <div style={{display:'flex', justifyContent:'space-between', fontSize: '0.75rem', marginBottom: '5px', color: '#666'}}>
+                        <span>Heatmap Opacity</span>
+                        <span>{Math.round(layerOpacity * 100)}%</span>
+                    </div>
+                    <input 
+                        type="range" 
+                        min="0" max="1" step="0.1" 
+                        value={layerOpacity}
+                        onChange={(e) => setLayerOpacity(parseFloat(e.target.value))}
+                        style={{width: '100%', accentColor: '#ff9900'}}
+                    />
                 </div>
               </div>
             ) : (
               <p style={{ fontSize: '0.9rem', color: '#666', lineHeight: '1.4' }}>
-                Select a provider and search an address to analyze.
+                Search an address or click the map to run the Python AI Engine.
               </p>
             )}
           </div>
@@ -233,9 +286,9 @@ export default function App() {
 
       <style>{`
         .spinner {
-          width: 18px; height: 18px;
+          width: 24px; height: 24px;
           border-radius: 50%;
-          border: 2px solid #ff9900;
+          border: 3px solid #ff9900;
           border-top-color: transparent;
           animation: spin 1s linear infinite;
         }
@@ -249,9 +302,9 @@ export default function App() {
         onMove={(evt) => setViewState(evt.viewState)}
         style={{ width: '100%', height: '100%' }}
         mapLib={maplibregl}
-        mapStyle={mapStyle as any} // Cast to any to avoid strict type issues with dynamic styles
+        mapStyle={mapStyle as any} 
         onClick={onMapClick}
-        cursor={isAnalyzing ? 'wait' : 'crosshair'}
+        cursor={status === 'loading' ? 'wait' : 'crosshair'}
       >
         <NavigationControl position="top-right" />
 
@@ -278,14 +331,14 @@ export default function App() {
                 id="solar-layer"
                 type="raster"
                 paint={{ 
-                  'raster-opacity': 0.8,
+                  'raster-opacity': layerOpacity,
                   'raster-fade-duration': 0 
                 }}
               />
             </Source>
 
-            {/* LOT POLYGON OVERLAY */}
-            {analysisResult.lot_polygon && (
+            {/* Optional: Lot Polygon (if supported in future) */}
+            {analysisResult.lot_polygon && analysisResult.lot_polygon.length > 0 && (
               <Source
                 id="lot-polygon"
                 type="geojson"
@@ -303,7 +356,8 @@ export default function App() {
                   type="line"
                   paint={{
                     'line-color': '#ff9900',
-                    'line-width': 3,
+                    'line-width': 2,
+                    'line-dasharray': [2, 2]
                   }}
                 />
               </Source>

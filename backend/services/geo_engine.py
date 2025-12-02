@@ -75,6 +75,9 @@ class GeoEngine:
                 boundless=True # Handle edge cases with padding
             )
             
+            # Keep the raw float32 data!
+            raw_height = height_data.copy() 
+            
             # Generate the 3-Channel Tensor (Height/Slope/Roughness)
             tensor = self.datagen.calculate_geometry(height_data)
             
@@ -85,4 +88,4 @@ class GeoEngine:
                 "bounds": [[minx, miny], [maxx, maxy]]
             }
             
-            return tensor, meta
+            return tensor, meta, raw_height

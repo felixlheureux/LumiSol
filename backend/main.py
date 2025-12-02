@@ -12,6 +12,7 @@ from transformers import Mask2FormerImageProcessor, Mask2FormerForUniversalSegme
 from scripts.pipeline.config import CONFIG
 from scripts.pipeline.post_processor import PostProcessor
 from services.geo_engine import GeoEngine
+from services.solar_engine import SolarEngine
 
 app = FastAPI()
 
@@ -40,6 +41,7 @@ async def startup_event():
     try:
         state["geo_engine"] = GeoEngine()
         state["post_processor"] = PostProcessor(CONFIG)
+        state["solar_engine"] = SolarEngine(CONFIG)
     except Exception as e:
         print(f"❌ Core services failed: {e}")
 
@@ -68,7 +70,7 @@ async def analyze(req: AnalysisRequest):
 
     try:
         # A. Fetch Data (On-Demand)
-        tensor, meta = state["geo_engine"].get_patch(req.lat, req.lon)
+        tensor, meta, raw_height = state["geo_engine"].get_patch(req.lat, req.lon)
         
         # B. Run Inference
         device = state["model"].device
@@ -95,10 +97,53 @@ async def analyze(req: AnalysisRequest):
         # Ideally, you'd do this twice: once in Pixels (for Heatmap), once in Meters (for Area calc)
         refined_polys_px = state["post_processor"].process_single_mask(binary_mask)
         
-        # E. Calculate Metrics
-        total_area_px = sum([p.area for p in refined_polys_px])
-        pixel_res_sq = 0.2 * 0.2 # 0.04 m2 per pixel
-        real_area = total_area_px * pixel_res_sq
+        # E. Calculate Metrics (UPDATED)
+        if not refined_polys_px:
+            raise HTTPException(404, "No roof detected.")
+
+        # 1. Identify the Main Roof (Largest Polygon)
+        main_poly_px = max(refined_polys_px, key=lambda p: p.area)
+        
+        # 2. Extract Geometry from Raster
+        # We need the Slope and Aspect of the pixels INSIDE this polygon
+        # A. Get raw height data from GeoEngine (Already fetched as raw_height)
+        
+        # B. Calculate Gradients (Slope/Aspect)
+        dy, dx = np.gradient(raw_height, 0.2) # 0.2m pixel size
+        slope_grid = np.degrees(np.arctan(np.sqrt(dx**2 + dy**2)))
+        aspect_grid = np.degrees(np.arctan2(-dx, dy)) % 360
+        
+        # C. Create a Mask for the Roof Polygon
+        import rasterio.features
+        mask_shape = raw_height.shape
+        roof_mask = rasterio.features.rasterize(
+            [main_poly_px], out_shape=mask_shape
+        ).astype(bool)
+        
+        # D. Sample the values
+        roof_slopes = slope_grid[roof_mask]
+        roof_aspects = aspect_grid[roof_mask]
+        
+        # E. Calculate Averages
+        avg_slope = np.mean(roof_slopes) if len(roof_slopes) > 0 else 0
+        
+        # Vector average for Aspect (to handle the 359°/1° crossover)
+        if len(roof_aspects) > 0:
+            rads = np.radians(roof_aspects)
+            avg_aspect = np.degrees(np.arctan2(
+                np.mean(np.sin(rads)), 
+                np.mean(np.cos(rads))
+            )) % 360
+        else:
+            avg_aspect = 180 # Default South
+            
+        # F. Calculate Real Area (m2)
+        real_area = main_poly_px.area * (0.2 * 0.2) 
+
+        # 3. Run the Simulation
+        graph_data, total_kwh = state["solar_engine"].simulate_year(
+            req.lat, req.lon, avg_slope, avg_aspect, real_area
+        )
         
         # F. Generate Heatmap Image (Base64)
         # We visualize the Input Height (Red Channel) + Green Contours
@@ -124,9 +169,10 @@ async def analyze(req: AnalysisRequest):
         return {
             "heatmap": f"data:image/png;base64,{img_str}",
             "bounds": [[w, s], [e, n]],
-            "solar_potential": f"{int(real_area * 150)} kWh/yr", # Mock physics (150kWh/m2)
+            "solar_potential": f"{int(total_kwh):,} kWh/yr",
             "area": f"{int(real_area)} m²",
-            "lot_polygon": [] # Can calculate this if vector_filter passed lot geometry
+            "lot_polygon": [],
+            "graph_data": graph_data
         }
 
     except ValueError as e:

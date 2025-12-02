@@ -26,4 +26,11 @@ dependencies = [
     "pyproj>=3.7.2",
     "fastapi>=0.123.4",
     "uvicorn>=0.38.0",
+    "pvlib>=0.13.1",
+    "pandas>=2.3.3",
+    "gdal==3.10.3",
+    "rvt-py>=2.2.3",
+    "openmeteo-requests>=1.7.4",
+    "requests-cache>=1.2.1",
+    "retry-requests>=2.0.0",
 ]
