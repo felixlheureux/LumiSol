@@ -64,3 +64,6 @@
 /backend/logs_mask2former/
 /backend/lightning_logs/
 /backend/*.ckpt
+/backend/.cache.sqlite
+/backend/models/
+

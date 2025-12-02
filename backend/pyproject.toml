@@ -33,4 +33,7 @@ dependencies = [
     "openmeteo-requests>=1.7.4",
     "requests-cache>=1.2.1",
     "retry-requests>=2.0.0",
+    "segment-geospatial>=0.14.1",
+    "leafmap>=0.57.9",
+    "localtileserver>=0.10.6",
 ]

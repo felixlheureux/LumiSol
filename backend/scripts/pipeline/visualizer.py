@@ -74,14 +74,24 @@ class ModelVisualizer:
                 outputs, target_sizes=target_sizes
             )[0]
             
-            # 'results' contains 'segmentation' (the map) and 'segments_info' (labels)
+            # results['segmentation'] is the 2D map of Instance IDs
             instance_map = results["segmentation"].cpu().numpy()
             
-            # --- NEW STEP: Post-Processing Visualization ---
+            # results['segments_info'] tells us which Class each Instance ID belongs to
+            # We want ONLY indices where label_id == 1 ("building")
+            # We ignore label_id == 0 ("background")
+            building_ids = [
+                seg['id'] for seg in results['segments_info'] 
+                if seg['label_id'] == 1 
+            ]
             
-            # Create a binary mask of the prediction for processing
-            # (Collapsing all instance IDs into 0 or 1 for shape analysis)
-            binary_pred = (instance_map > -1).astype(np.uint8)
+            # Create a binary mask ONLY for buildings
+            if building_ids:
+                # Set pixel to 1 if its ID is in our list of building_ids
+                binary_pred = np.isin(instance_map, building_ids).astype(np.uint8)
+            else:
+                # If no buildings found, mask is empty
+                binary_pred = np.zeros_like(instance_map, dtype=np.uint8)
             
             # Run the Strategy A pipeline
             refined_polys = self.post_processor.process_single_mask(binary_pred)

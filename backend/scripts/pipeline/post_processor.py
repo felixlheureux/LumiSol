@@ -13,49 +13,58 @@ from buildingregulariser import regularize_geodataframe
 class PostProcessor:
     def __init__(self, config):
         self.config = config
-        self.pixel_res = 0.2  # 20cm per pixel
-        
-        # Calculate dilation: 0.5m target
+        self.pixel_res = 0.2
         self.dilation_meters = config.get("MASK_EROSION", 0.5)
         self.dilation_pixels = self.dilation_meters / self.pixel_res
 
     def regularize_geometry(self, polygons, crs=None):
         """
-        Wraps the Building-Regulariser library.
-        Handles both Pixel (None CRS) and Metric (Projected CRS) data.
+        Hybrid Regularization:
+        1. Try Oriented Bounding Box (OBB) snapping first (Perfect Rectangles).
+        2. Fallback to Building-Regulariser for complex shapes (L-shape, U-shape).
         """
-        if not polygons: return []
+        refined = []
+        
+        for poly in polygons:
+            if poly.is_empty: continue
+            
+            # --- Strategy 1: OBB Snap (The "Anti-Blob" Fix) ---
+            # Get the Minimum Rotated Rectangle (Perfect Box)
+            obb = poly.minimum_rotated_rectangle
+            
+            # Calculate similarity (Intersection over Union)
+            # If the blob is 85% similar to its bounding box, IT IS A BOX.
+            iou = poly.intersection(obb).area / obb.area
+            
+            if iou > 0.85:
+                # Force perfect rectangle
+                refined.append(obb)
+                continue
+            
+            # --- Strategy 2: Library Regularization (Complex Shapes) ---
+            # If it's an L-shape, OBB fits poorly (IoU < 0.85).
+            # So we use the heavy library to clean up the L-shape edges.
+            
+            # Simplify first to remove pixel stair-steps (Critical for library to work)
+            simple_poly = poly.simplify(0.5, preserve_topology=True)
+            
+            try:
+                gdf = gpd.GeoDataFrame(geometry=[simple_poly], crs=crs)
+                reg_gdf = regularize_geodataframe(
+                    gdf,
+                    simplify_tolerance=0.5,
+                    parallel_threshold=1.5,
+                    allow_45_degree=True
+                )
+                refined.append(reg_gdf.geometry.iloc[0])
+            except:
+                # Fallback to the simplified blob if library fails
+                refined.append(simple_poly)
 
-        gdf = gpd.GeoDataFrame(geometry=polygons, crs=crs)
-        
-        # Adjust parameters based on units (Meters vs Pixels)
-        # If CRS is None, we assume we are in Pixel Space (Visualizer)
-        is_pixel_space = crs is None
-        
-        # Critical Tuning for Building-Regulariser
-        # simplify_tolerance: removes stair-case pixels before squaring.
-        # Should be ~2-3x the resolution.
-        tol = 1.0 if is_pixel_space else 0.2
-        
-        try:
-            reg_gdf = regularize_geodataframe(
-                gdf,
-                simplify_tolerance=tol,
-                parallel_threshold=2.0,
-                allow_45_degree=True, # Critical for L-shapes/Bay windows
-                allow_circles=False,  # Turn off for roofs (usually)
-                num_cores=1           # Keep 1 for single-image debug to avoid overhead
-            )
-            return reg_gdf.geometry.tolist()
-        except Exception as e:
-            print(f"⚠️ Regularization failed: {e}")
-            return polygons # Fallback to raw dilation
+        return refined
 
     def process_single_mask(self, binary_mask):
-        """
-        Used by Visualizer (Pixel Space)
-        """
-        # 1. Vectorize (Raster -> Polygons)
+        """ Used by Visualizer (Pixel Space) """
         shapes = rasterio.features.shapes(
             binary_mask.astype(np.uint8), 
             mask=binary_mask.astype(bool)
@@ -65,12 +74,10 @@ class PostProcessor:
         for geom, val in shapes:
             if val == 1: 
                 poly = shape(geom)
-                # 2. Dilation (Strategy A)
-                # Join_style=2 (Mitre) preserves sharp corners
+                # Dilation buffer
                 dilated = poly.buffer(self.dilation_pixels, join_style=2)
                 dilated_polygons.append(dilated)
         
-        # 3. Robust Regularization (Using Library)
         return self.regularize_geometry(dilated_polygons, crs=None)
 
     def polygons_to_image(self, polygons, shape):
@@ -93,11 +100,7 @@ class PostProcessor:
         return vis_image
 
     def vectorize_and_recover(self, prediction_mask, transform):
-        """
-        Converts raster mask -> Polygons -> Dilated Polygons (+0.5m).
-        """
-        # 1. Vectorize (Raster -> Raw Polygons)
-        # mask=prediction_mask ensures we only vectorize 'True' pixels
+        """ Used by API (Geo Space) """
         shapes = rasterio.features.shapes(
             prediction_mask.astype(np.uint8), 
             mask=prediction_mask.astype(bool), 
@@ -106,18 +109,10 @@ class PostProcessor:
 
         polygons = []
         for geom, val in shapes:
-            if val == 1: # Class 1 = Building
+            if val == 1:
                 poly = shape(geom)
-                
-                # 2. Dilation (Strategy A)
-                # We buffer by +0.5m (dilation_meters) to reverse the training erosion.
-                # join_style=2 (Mitre) preserves sharp corners better than Round (1).
+                # Buffer in METERS
                 recovered_poly = poly.buffer(self.dilation_meters, join_style=2)
-                
-                # Simplify slightly to remove pixel-stair-stepping before regularization
-                # tolerance=0.1m removes tiny jitter without losing shape
-                clean_poly = recovered_poly.simplify(0.1, preserve_topology=True)
-                
                 polygons.append(clean_poly)
         
         return polygons

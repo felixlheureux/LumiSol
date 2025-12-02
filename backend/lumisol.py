@@ -68,7 +68,8 @@ def train(
         help="Hardware architecture strategy (mps, cuda, cpu)"
     ),
     epochs: int = typer.Option(CONFIG["TRAIN_EPOCHS"], help="Override epochs"),
-    batch_size: int = typer.Option(CONFIG["TRAIN_BATCH_SIZE"], help="Override batch size")
+    batch_size: int = typer.Option(CONFIG["TRAIN_BATCH_SIZE"], help="Override batch size"),
+    debug: bool = typer.Option(False, "--debug", "-d", help="Run fast sanity check on 1 batch")
 ):
     """Step 4: Train the Mask2Former model."""
     
@@ -82,6 +83,7 @@ def train(
     # Apply CLI overrides
     run_config["TRAIN_EPOCHS"] = epochs
     run_config["TRAIN_BATCH_SIZE"] = batch_size
+    run_config["DEBUG"] = debug
     
     typer.echo(f"🧠 Training on [{arch.value.upper()}] | Precision: {arch_settings['PRECISION']} | Workers: {arch_settings['NUM_WORKERS']}")
     

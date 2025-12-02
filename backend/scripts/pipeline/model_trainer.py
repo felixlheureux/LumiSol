@@ -270,18 +270,25 @@ class ModelTrainer:
         )
         
         # 5. Trainer (Dynamic Architecture)
-        trainer = pl.Trainer(
-            max_epochs=self.config["TRAIN_EPOCHS"],
+        trainer_args = {
+            "max_epochs": self.config["TRAIN_EPOCHS"],
+            "accelerator": self.config.get("ACCELERATOR", "auto"),
+            "devices": self.config.get("DEVICES", "auto"),
+            "precision": self.config.get("PRECISION", "32-true"),
+            "accumulate_grad_batches": self.config.get("ACCUMULATE_BATCHES", 1),
+            "log_every_n_steps": 5,
+            "default_root_dir": "logs_mask2former"
+        }
+
+        # 👇 The Magic Switch
+        if self.config.get("DEBUG"):
+            print("🐞 DEBUG MODE: Overfitting on 1 batch. This should take ~2 mins.")
+            trainer_args["overfit_batches"] = 1
+            trainer_args["max_epochs"] = 100 # Force it to memorize this batch
+            trainer_args["check_val_every_n_epoch"] = 100 # Disable validation checks
+            trainer_args["log_every_n_steps"] = 1 # Log every step
             
-            # 👇 Inject Dynamic Settings Here
-            accelerator=self.config.get("ACCELERATOR", "auto"),
-            devices=self.config.get("DEVICES", "auto"),
-            precision=self.config.get("PRECISION", "32-true"),
-            accumulate_grad_batches=self.config.get("ACCUMULATE_BATCHES", 1),
-            
-            log_every_n_steps=5,
-            default_root_dir="logs_mask2former"
-        )
+        trainer = pl.Trainer(**trainer_args)
         
         print("🚀 Starting Training...")
         trainer.fit(model, train_loader, val_loader)
