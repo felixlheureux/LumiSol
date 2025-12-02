@@ -9,6 +9,7 @@ import Map, {
   NavigationControl,
   Source,
 } from 'react-map-gl/maplibre';
+import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis } from 'recharts';
 
 // Components
 import AddressAutocomplete from './components/AddressAutocomplete';
