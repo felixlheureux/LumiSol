@@ -11,6 +11,9 @@ import evaluate
 import albumentations as A
 from transformers import get_polynomial_decay_schedule_with_warmup
 
+# Fix for MPS (Mac) missing operators
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 # --- AUGMENTATION ---
 # Geometric transforms only (no color shifts for LiDAR data)
 train_transform = A.Compose([
@@ -68,13 +71,19 @@ class SolarInstanceDataset(Dataset):
             mask = augmented['mask']
         
         # 3. Preprocess for Mask2Former
-        # The processor handles resizing, normalization, and converting instance masks
-        # into the binary mask list required by the Transformer.
+        # We need to map all instance IDs to the "building" class (ID=1)
+        # Background (ID=0) maps to 0.
+        unique_ids = np.unique(mask)
+        instance_id_to_semantic_id = {0: 0}
+        for uid in unique_ids:
+            if uid == 0: continue
+            instance_id_to_semantic_id[uid] = 1
+            
         try:
             inputs = self.processor(
                 images=image,
                 segmentation_maps=mask,
-                task_inputs=["instance"],
+                instance_id_to_semantic_id=instance_id_to_semantic_id,
                 return_tensors="pt"
             )
         except Exception as e:
@@ -82,7 +91,17 @@ class SolarInstanceDataset(Dataset):
             raise e
         
         # Remove batch dimension added by processor (since we use a DataLoader)
-        return {k: v.squeeze(0) for k, v in inputs.items()}
+        # Some outputs (like mask_labels) are lists of tensors, others are tensors.
+        processed_inputs = {}
+        for k, v in inputs.items():
+            if isinstance(v, list):
+                processed_inputs[k] = v[0]
+            elif isinstance(v, torch.Tensor):
+                processed_inputs[k] = v.squeeze(0)
+            else:
+                processed_inputs[k] = v
+                
+        return processed_inputs
 
 def collate_fn(batch):
     """
@@ -125,6 +144,8 @@ class SolarMask2Former(pl.LightningModule):
             label2id={v: k for k, v in self.id2label.items()},
             ignore_mismatched_sizes=True 
         )
+        # Ensure model is in train mode to silence PL warning
+        self.model.train()
         
         # Metric
         self.iou_metric = evaluate.load("mean_iou")
@@ -173,7 +194,9 @@ class ModelTrainer:
         self.config = config
         self.processor = Mask2FormerImageProcessor.from_pretrained(
             self.config["MODEL_CHECKPOINT"],
-            do_normalize=False # Important for geometric data
+            do_normalize=False,  # CRITICAL: Keep this False for geometric data
+            do_resize=False,     # ADD THIS: You already resized in DataGenerator
+            do_rescale=True,     # ADD THIS: Rescales 0-255 inputs to 0-1
         )
 
     def run(self):
@@ -222,19 +245,22 @@ class ModelTrainer:
             masks=list(val_msks)
         )
         
-        # 3. DataLoaders
+        # 3. DataLoaders (Dynamic Workers)
+        # Use config["NUM_WORKERS"] instead of hardcoded 0
         train_loader = DataLoader(
             train_set, 
             batch_size=self.config["TRAIN_BATCH_SIZE"], 
             shuffle=True, 
             collate_fn=collate_fn, 
-            num_workers=0
+            num_workers=self.config.get("NUM_WORKERS", 0), # Default to 0 if missing
+            persistent_workers=(self.config.get("NUM_WORKERS", 0) > 0) # Optimization for workers > 0
         )
         val_loader = DataLoader(
             val_set, 
             batch_size=self.config["TRAIN_BATCH_SIZE"], 
             collate_fn=collate_fn, 
-            num_workers=0
+            num_workers=self.config.get("NUM_WORKERS", 0),
+            persistent_workers=(self.config.get("NUM_WORKERS", 0) > 0)
         )
         
         # 4. Initialize Model
@@ -243,14 +269,18 @@ class ModelTrainer:
             model_checkpoint=self.config["MODEL_CHECKPOINT"]
         )
         
-        # 5. Trainer with Configured Epochs
+        # 5. Trainer (Dynamic Architecture)
         trainer = pl.Trainer(
-            max_epochs=self.config["TRAIN_EPOCHS"], 
-            accelerator="auto",
+            max_epochs=self.config["TRAIN_EPOCHS"],
+            
+            # 👇 Inject Dynamic Settings Here
+            accelerator=self.config.get("ACCELERATOR", "auto"),
+            devices=self.config.get("DEVICES", "auto"),
+            precision=self.config.get("PRECISION", "32-true"),
+            accumulate_grad_batches=self.config.get("ACCUMULATE_BATCHES", 1),
+            
             log_every_n_steps=5,
-            default_root_dir="logs_mask2former",
-            accumulate_grad_batches=4,
-            precision="16-mixed"
+            default_root_dir="logs_mask2former"
         )
         
         print("🚀 Starting Training...")

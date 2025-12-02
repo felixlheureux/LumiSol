@@ -60,4 +60,7 @@
 .DS_Store
 .vscode/     # Ignore user-specific VS Code settings (workspace cache)
 
-sample.tif
+# PyTorch Lightning Logs & Checkpoints
+/backend/logs_mask2former/
+/backend/lightning_logs/
+/backend/*.ckpt

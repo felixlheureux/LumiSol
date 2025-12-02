@@ -17,6 +17,7 @@ CONFIG = {
     # Training Data Output
     "OUTPUT_DIR": os.path.join(DATA_DIR, "processed", "mask2former_data"),
     "MODEL_OUTPUT_DIR": os.path.join(BASE_DIR, "models", "lumisol_v1"),
+    "VISUALIZATION_DIR": os.path.join(DATA_DIR, "processed", "test_results"),
     
     # --- Data Generation Params ---
     "CHIP_SIZE": 512,
