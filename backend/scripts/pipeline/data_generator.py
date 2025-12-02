@@ -4,6 +4,9 @@ import numpy as np
 import rasterio
 from rasterio.features import rasterize
 from rasterio.windows import Window
+from rasterio.windows import from_bounds as window_from_bounds
+from rasterio.transform import from_bounds as transform_from_bounds
+from rasterio.enums import Resampling
 import geopandas as gpd
 from shapely.geometry import box, shape
 from pathlib import Path
@@ -22,6 +25,9 @@ class DataGenerator:
             Path(f"{self.config['OUTPUT_DIR']}/{d}").mkdir(parents=True, exist_ok=True)
 
     def calculate_geometry(self, height_array):
+        # Ensure float64 to prevent overflow in gradient/slope calc
+        height_array = height_array.astype(np.float64)
+
         # 1. Apply Gaussian Smoothing (As promised in README)
         # sigma=0.5 pixels helps reduce Aliasing/Lidar noise
         smoothed_height = scipy.ndimage.gaussian_filter(height_array, sigma=0.5)
@@ -137,21 +143,36 @@ class DataGenerator:
                         
                         # ... rest of logic uses 'geom' ...
                         cx, cy = geom.centroid.x, geom.centroid.y
-                        py, px = src_lidar.index(cx, cy)
                         
-                        win_x = max(0, min(px - self.config['CHIP_SIZE'] // 2, src_lidar.width - self.config['CHIP_SIZE']))
-                        win_y = max(0, min(py - self.config['CHIP_SIZE'] // 2, src_lidar.height - self.config['CHIP_SIZE']))
-                        window = Window(win_x, win_y, self.config['CHIP_SIZE'], self.config['CHIP_SIZE'])
+                        # Define Optimized Zoom
+                        TARGET_RESOLUTION = 0.2  # 20cm per pixel
+                        CHIP_SIZE_METERS = self.config['CHIP_SIZE'] * TARGET_RESOLUTION
                         
-                        # Read Height
-                        height = src_lidar.read(1, window=window)
+                        # 1. Calculate the window in METERS (Physical Space)
+                        minx = cx - CHIP_SIZE_METERS / 2
+                        maxx = cx + CHIP_SIZE_METERS / 2
+                        miny = cy - CHIP_SIZE_METERS / 2
+                        maxy = cy + CHIP_SIZE_METERS / 2
+                        
+                        # 2. Convert Meters -> Source Pixels
+                        lidar_window = window_from_bounds(minx, miny, maxx, maxy, transform=src_lidar.transform)
+                        
+                        # 3. Read and RESAMPLE to 512x512
+                        height = src_lidar.read(
+                            1,
+                            window=lidar_window,
+                            out_shape=(self.config['CHIP_SIZE'], self.config['CHIP_SIZE']),
+                            resampling=Resampling.bilinear,
+                            boundless=True
+                        )
                         
                         # GEOMETRIC FEATURES
                         geo_tensor = self.calculate_geometry(height)
                         
                         # MASK GENERATION
-                        win_transform = src_lidar.window_transform(window)
-                        bounds = rasterio.windows.bounds(window, src_lidar.transform)
+                        # Update transform for the new resampled grid
+                        win_transform = transform_from_bounds(minx, miny, maxx, maxy, self.config['CHIP_SIZE'], self.config['CHIP_SIZE'])
+                        bounds = (minx, miny, maxx, maxy)
                         box_geom = box(*bounds)
                         
                         # Intersection check for mask generation
