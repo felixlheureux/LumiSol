@@ -22,4 +22,5 @@ dependencies = [
     "albumentations>=2.0.8",
     "typer>=0.20.0",
     "pillow>=12.0.0",
+    "buildingregulariser>=0.2.4",
 ]

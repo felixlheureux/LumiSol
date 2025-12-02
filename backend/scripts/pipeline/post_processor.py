@@ -8,52 +8,70 @@ from shapely.geometry import shape, Polygon
 from shapely.ops import unary_union
 from pathlib import Path
 from tqdm import tqdm
+from buildingregulariser import regularize_geodataframe
 
 class PostProcessor:
     def __init__(self, config):
         self.config = config
-        self.erosion_distance = config.get("MASK_EROSION", 0.5)
-        # Calculate dilation in PIXELS
-        # Strategy A: We eroded by 0.5m. We must dilate by 0.5m.
-        # Resolution is fixed at 0.2m/pixel (from DataGenerator)
-        self.pixel_resolution = 0.2 
-        self.dilation_pixels = self.erosion_distance / self.pixel_resolution
+        self.pixel_res = 0.2  # 20cm per pixel
+        
+        # Calculate dilation: 0.5m target
+        self.dilation_meters = config.get("MASK_EROSION", 0.5)
+        self.dilation_pixels = self.dilation_meters / self.pixel_res
+
+    def regularize_geometry(self, polygons, crs=None):
+        """
+        Wraps the Building-Regulariser library.
+        Handles both Pixel (None CRS) and Metric (Projected CRS) data.
+        """
+        if not polygons: return []
+
+        gdf = gpd.GeoDataFrame(geometry=polygons, crs=crs)
+        
+        # Adjust parameters based on units (Meters vs Pixels)
+        # If CRS is None, we assume we are in Pixel Space (Visualizer)
+        is_pixel_space = crs is None
+        
+        # Critical Tuning for Building-Regulariser
+        # simplify_tolerance: removes stair-case pixels before squaring.
+        # Should be ~2-3x the resolution.
+        tol = 1.0 if is_pixel_space else 0.2
+        
+        try:
+            reg_gdf = regularize_geodataframe(
+                gdf,
+                simplify_tolerance=tol,
+                parallel_threshold=2.0,
+                allow_45_degree=True, # Critical for L-shapes/Bay windows
+                allow_circles=False,  # Turn off for roofs (usually)
+                num_cores=1           # Keep 1 for single-image debug to avoid overhead
+            )
+            return reg_gdf.geometry.tolist()
+        except Exception as e:
+            print(f"⚠️ Regularization failed: {e}")
+            return polygons # Fallback to raw dilation
 
     def process_single_mask(self, binary_mask):
         """
-        Pipeline: Raster -> Vector -> Dilate -> Regularize -> Raster (for Vis)
+        Used by Visualizer (Pixel Space)
         """
         # 1. Vectorize (Raster -> Polygons)
-        # We use a distinct mask=binary_mask to only grab the "1"s
         shapes = rasterio.features.shapes(
             binary_mask.astype(np.uint8), 
             mask=binary_mask.astype(bool)
         )
 
-        refined_polygons = []
-        
+        dilated_polygons = []
         for geom, val in shapes:
             if val == 1: 
                 poly = shape(geom)
-                
                 # 2. Dilation (Strategy A)
-                # Expands the polygon outward by ~2.5 pixels (0.5m)
-                dilated = poly.buffer(self.dilation_pixels, join_style=2) # 2=Mitre (Sharp corners)
-                
-                # 3. Regularization (Simple "Squaring")
-                # For visualization, we use the Oriented Bounding Box (OBB) 
-                # as a proxy for complex regularization.
-                # In production, use 'Building-Regulariser' library here.
-                regularized = dilated.minimum_rotated_rectangle
-                
-                # Only accept regularization if it doesn't deviate too much (IoU check)
-                # If the building is L-shaped, OBB is bad, so we keep the dilated version.
-                if dilated.intersection(regularized).area / regularized.area > 0.85:
-                    refined_polygons.append(regularized)
-                else:
-                    refined_polygons.append(dilated.simplify(0.5)) # Fallback: simple smoothing
-
-        return refined_polygons
+                # Join_style=2 (Mitre) preserves sharp corners
+                dilated = poly.buffer(self.dilation_pixels, join_style=2)
+                dilated_polygons.append(dilated)
+        
+        # 3. Robust Regularization (Using Library)
+        return self.regularize_geometry(dilated_polygons, crs=None)
 
     def polygons_to_image(self, polygons, shape):
         """
@@ -92,9 +110,9 @@ class PostProcessor:
                 poly = shape(geom)
                 
                 # 2. Dilation (Strategy A)
-                # We buffer by +0.5m to reverse the training erosion.
+                # We buffer by +0.5m (dilation_meters) to reverse the training erosion.
                 # join_style=2 (Mitre) preserves sharp corners better than Round (1).
-                recovered_poly = poly.buffer(self.erosion_distance, join_style=2)
+                recovered_poly = poly.buffer(self.dilation_meters, join_style=2)
                 
                 # Simplify slightly to remove pixel-stair-stepping before regularization
                 # tolerance=0.1m removes tiny jitter without losing shape
@@ -103,32 +121,6 @@ class PostProcessor:
                 polygons.append(clean_poly)
         
         return polygons
-
-    def regularize_polygon(self, polygon):
-        """
-        Force-squares the polygon edges. 
-        Implements a simplified version of the 'Building-Regulariser' logic.
-        """
-        if polygon.is_empty: return polygon
-        
-        # Calculate the Oriented Bounding Box (OBB)
-        # This gives us the "Dominant Angle" of the building
-        obb = polygon.minimum_rotated_rectangle
-        
-        # For simple rectangular roofs, the OBB is often the best regularization
-        # For complex L-shapes, we would need a more complex 'rectification' lib
-        # But OBB is a strong baseline for solar analysis (azimuth/tilt).
-        
-        # Calculate Intersection over Union to see if OBB is a good fit
-        iou = polygon.intersection(obb).area / obb.area
-        
-        # If the building is mostly rectangular (>90% fit), snap to the rectangle
-        if iou > 0.90:
-            return obb
-        
-        # Otherwise, return the dilated (but irregular) polygon
-        # (Real implementation of 'Building-Regulariser' would go here for L-shapes)
-        return polygon
 
     def calculate_solar_attributes(self, polygon, height_map, transform):
         """
@@ -182,12 +174,15 @@ class PostProcessor:
                 # A. Vectorize & Dilate
                 raw_polys = self.vectorize_and_recover(mask, transform)
                 
-                # B. Regularize & Attribute
-                for poly in raw_polys:
-                    reg_poly = self.regularize_polygon(poly)
-                    attrs = self.calculate_solar_attributes(reg_poly, None, transform)
+                # B. Regularize (Batch)
+                # Use the new library-based regularization
+                reg_polys = self.regularize_geometry(raw_polys, crs=crs)
+                
+                # C. Attribute
+                for poly in reg_polys:
+                    attrs = self.calculate_solar_attributes(poly, None, transform)
                     
-                    record = {'geometry': reg_poly}
+                    record = {'geometry': poly}
                     record.update(attrs)
                     all_buildings.append(record)
 

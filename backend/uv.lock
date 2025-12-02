@@ -173,6 +173,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "albumentations" },
+    { name = "buildingregulariser" },
     { name = "evaluate" },
     { name = "fiona" },
     { name = "geopandas" },
@@ -194,6 +195,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "albumentations", specifier = ">=2.0.8" },
+    { name = "buildingregulariser", specifier = ">=0.2.4" },
     { name = "evaluate", specifier = ">=0.4.1" },
     { name = "fiona", specifier = ">=1.10.1" },
     { name = "geopandas", specifier = ">=1.1.1" },
@@ -210,6 +212,19 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "transformers", specifier = ">=4.38.0" },
     { name = "typer", specifier = ">=0.20.0" },
+]
+
+[[package]]
+name = "buildingregulariser"
+version = "0.2.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "geopandas" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e5/8d/23aed745edb572e7f14c8c0c391a2f6ef59862ee2bc73b1c5c4a0f40e442/buildingregulariser-0.2.4.tar.gz", hash = "sha256:29a59fc9d716a91e5ff0c49cda1ab91a7018eea6d1ba6667854468260ba8dd3b", size = 20970, upload-time = "2025-07-24T06:21:03.579Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b4/08/75f0755565ec7f4d8beb997558c1250c3e5810c1fd09b762aa92eb7f5028/buildingregulariser-0.2.4-py3-none-any.whl", hash = "sha256:69a02146ac4f5a9c4afbc43e13e3093e4b8afd2c9f1352a8ba77f1053cbbc4e0", size = 19525, upload-time = "2025-07-24T06:21:02.327Z" },
 ]
 
 [[package]]
