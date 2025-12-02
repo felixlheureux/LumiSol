@@ -23,4 +23,7 @@ dependencies = [
     "typer>=0.20.0",
     "pillow>=12.0.0",
     "buildingregulariser>=0.2.4",
+    "pyproj>=3.7.2",
+    "fastapi>=0.123.4",
+    "uvicorn>=0.38.0",
 ]
